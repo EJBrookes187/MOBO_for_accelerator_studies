@@ -1,0 +1,79 @@
+[INPUTS]
+# control knobs
+# name = min limit, max limit, step size
+Quad1 current norm = 0.0, 1.0, 0.1
+Quad2 current norm = 0.0, 1.0, 0.1
+Steerer1x current norm = 0.0, 1.0, 0.1
+Steerer2x current norm = 0.0, 1.0, 0.1
+Steerer1y current norm = 0.0, 1.0, 0.1
+Steerer2y current norm = 0.0, 1.0, 0.1
+
+[OBJECTIVES]
+# Parameters to optimise
+# name = optimising direction (min or max), reference point
+# reference point value should be definitely larger than any expected sample in output space
+y beam size [mm] = min, 100
+beam intensity [A] = max, 100
+
+
+[CONSTRAINTS]
+# Parameters used as constraints
+# name = sense (<, >, <=, >=), threshold value, optional: scale factor for normalisation
+# Final charge [nC] = >=, 2
+x beam size [mm] = <=, 10, 10
+x beam position on screen [mm] = <=, 0.5, 0.5
+#y beam position on screen [mm] = <=, 0.5, 0.5
+#x beam position on entrance BPM [mm] = <=, 0.1, 0.1
+#y beam position on entrance BPM [mm] = <=, 0.1, 0.1
+#x beam position on exit BPM [mm] = <=, 0.1, 0.1
+#y beam position on exit BPM [mm] = <=, 0.1, 0.1
+
+
+[INITIAL_SAMPLES]
+# Must be same length as no_of_meas
+# sample name = control knob values (in order same as above) | objective values (same order as above) | rms values for each objective (order of objectives above) | values of contraining parameters (same order as specified)
+#   s0 = x1, x2, ... | obj1, obj2, ... | rms1, rms2, ... | con1, con2, ...
+#   if left empty, will sample randomly
+s0 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 | 0.23, 0.02 | 1e-3, 1e-3 | 9.0, 0.1, 0.1, 0.01, 0.01, 0.01, 0.01
+s1 = 0.1, 0.0, 0.0, 0.0, 0.0, 0.0 | 0.50, 0.016 | 1e-3, 1e-3 | 8.5, 0.1, 0.1, 0.01, 0.01, 0.01, 0.01
+#training_csv_path=/.../MOBO_test/Example_initial_samples.csv
+
+
+[GENERAL]
+# Core run settings 
+#               evaluation method: ASTRA, NN, MANUAL, GOAL_FUNCTION
+#               weight and weighting: if some objectives hold more importance than others, weight them heavier (weights are relative), and turn on weighting
+#               iterations: how many iterations to run for recommended: ~10*no of input dimensions (no less than 50)
+#               no_of_meas: number of initial samples recommended:>=5*number of input dimensions
+#               batch_size: if evaluating with multi-processing, set the number of samples to evaluate simultaneously
+
+
+evaluation_method = GOAL_FUNCTION
+weighting = false
+weight = 1, 1, 1, 1, 1
+iterations = 70
+no_of_meas = 10
+batch_size = 5
+
+# Save settings, optimisation save name and location
+save_name = THz_mobo_run0
+working_dir=/.../MOBO_test/
+
+# Optimisation controls: restart from a specified iteration
+resume = false
+restart_from_iteration = 0
+
+# Noise handling: if rms values are available, use_real_rms = True, otherwise sets rms values to default_objective_rms
+use_real_rms = True
+default_objective_rms = 1e-10
+
+# Goal-function evaluator options: location and name of goal function
+goal_function_path = /.../MOBO_test/Example_goal_function.py
+goal_function_name = goal_function
+
+# Constraint penalty 
+feasible_tol = 0.0
+constraint_penalty_alpha = 0.0
+
+
+
