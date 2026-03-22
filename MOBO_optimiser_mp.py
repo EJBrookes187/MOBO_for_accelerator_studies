@@ -23,6 +23,7 @@ from scipy.stats import qmc
 import time
 import pandas as pd
 import subprocess
+import json
 
 def _get_working_dir(config):
     wd = getattr(config, 'working_dir', None) or '.'
@@ -220,30 +221,53 @@ def build_discrete_grid(input_specs, order="input0_slowest"):
 
     return X_grid, levels
 
+def region_exponential_penalty(values, lower, upper, scale=1.0, rate=5.0):
+    values = np.asarray(values, dtype=float)
+
+    d = np.zeros_like(values)
+
+    below = values < lower
+    above = values > upper
+
+    d[below] = lower - values[below]
+    d[above] = values[above] - upper
+
+    penalty = np.zeros_like(values)
+    mask = d > 0
+
+    penalty[mask] = scale * (np.exp(rate * d[mask]) - 1.0)
+
+    return penalty
 
 
-def extract_Y_CV_details(raw_outputs, objectives_spec, constraints_spec, method):
+def extract_Y_CV_details(raw_outputs, con_outputs, objectives_spec, constraints_spec, method, penalty_outputs=None, penalty_specs=None):
     """Like extract_Y_CV, but also returns per-constraint values and per-constraint violations.
     """
     method = str(method).upper()
     raw = np.asarray(raw_outputs, dtype=float)
+    con = np.asarray(con_outputs, dtype=float)
     raw = np.atleast_2d(raw)
+    con = np.atleast_2d(con)
 
     n_obj = len(objectives_spec)
     n_con = len(constraints_spec)
+    penalty_specs = penalty_specs or []
+    n_samples = raw.shape[0]
+
+    total_penalty = np.zeros(n_samples)
 
     # strict shape validation to ensure constraints returned match config
     if method in ("MANUAL", "GOAL_FUNCTION", "GOAL", "FUNC", "FUNCTION"):
-        expected = int(n_obj + n_con)
+        expected = int(n_obj)
         if raw.shape[1] < expected:
             raise ValueError(
                 f"Evaluator returned {raw.shape[1]} values per point, but config expects {expected} "
-                f"(n_obj={n_obj}, n_con={n_con}). Ensure the goal function returns objectives + ALL constraints."
+                f"(n_obj={n_obj}, n_con={n_con}). Ensure the goal function returns objectives + all constraints."
             )
     else:
         req = [int(o["index"]) for o in objectives_spec]
-        if n_con:
-            req += [int(c["index"]) for c in constraints_spec]
+        # if n_con:
+        #     req += [int(c["index"]) for c in constraints_spec]
         if req:
             max_idx = int(np.max(req))
             if raw.shape[1] <= max_idx:
@@ -252,19 +276,10 @@ def extract_Y_CV_details(raw_outputs, objectives_spec, constraints_spec, method)
                     f"Ensure the evaluator returns all outputs required for objectives/constraints."
                 )
 
-    if method in ("MANUAL", "GOAL_FUNCTION"):
-        # Manual returns [obj..., con...] in entered order
-        Y_phys = raw[:, :n_obj]
-        C = raw[:, n_obj:n_obj+n_con] if n_con else np.empty((raw.shape[0], 0))
-    else:
-        # ASTRA / NN return a long "raw output vector" -> use config indices
-        obj_idx = [int(o["index"]) for o in objectives_spec]
-        Y_phys = raw[:, obj_idx]
-        if n_con:
-            con_idx = [int(c["index"]) for c in constraints_spec]
-            C = raw[:, con_idx]
-        else:
-            C = np.empty((raw.shape[0], 0))
+    # Manual returns [obj..., con...] in entered order
+    Y_phys = raw # [:, :n_obj]
+    C = con #raw[:, n_obj:n_obj+n_con] if n_con else np.empty((raw.shape[0], 0))
+
 
     # convert max objectives to minimisation
     Y = Y_phys.copy()
@@ -297,10 +312,35 @@ def extract_Y_CV_details(raw_outputs, objectives_spec, constraints_spec, method)
                 viol = viol / scale
 
             V[:, j] = viol
-
         CV = np.max(V, axis=1)
 
-    return Y, CV, C, V, Y_phys
+    penalty_specs = penalty_specs or []
+    penalty_outputs = np.asarray(penalty_outputs, dtype=float) if penalty_outputs is not None else np.empty((raw.shape[0], 0))
+
+    if penalty_specs:
+        if penalty_outputs.shape[1] != len(penalty_specs):
+            raise ValueError(
+                f"Penalty output width {penalty_outputs.shape[1]} does not match number of penalties {len(penalty_specs)}."
+            )
+        P = np.zeros((raw.shape[0], len(penalty_specs)), dtype=float)
+        for j, p in enumerate(penalty_specs):
+            P[:, j] = region_exponential_penalty(
+                penalty_outputs[:, j],
+                lower=float(p["lower"]),
+                upper=float(p["upper"]),
+                scale=float(p.get("scale", 1.0)),
+                rate=float(p.get("rate", 5.0))
+            )
+        total_penalty = np.sum(P, axis=1)
+    else:
+        P = np.empty((raw.shape[0], 0), dtype=float)
+        total_penalty = np.zeros(raw.shape[0], dtype=float)
+
+    # penalised objectives
+    Y_pen = Y + total_penalty[:, None]
+
+    return Y_pen, CV, C, V, Y_phys, penalty_outputs, P, total_penalty
+
 
 
 @dataclass
@@ -367,6 +407,9 @@ class InitialSetup():
         self.input_pool = None
         self.output_pool = None
         self.constraint_pool = None
+        self.constraint_value_pool = None
+        self.constraint_violation_pool = None
+        self.penalty_raw_pool = None
         self.input_scaler = None
         self.output_scaler = None
 
@@ -389,14 +432,15 @@ class InitialSetup():
 
             n_obj = len(self.experiment.objectives_spec)
             n_con = len(self.experiment.constraints_spec)
+            n_pen = len(self.experiment.penalties)
 
             if n_inputs == 0:
                 raise ValueError(
-                    "No input columns defined. Check [INPUTS] parsing in config."
+                    "No input columns defined. Check [INPUTS]"
                 )
 
             # Validate CSV shape
-            expected_min_cols = n_inputs + n_obj
+            expected_min_cols = n_inputs + n_obj + n_pen
             if df.shape[1] < expected_min_cols:
                 raise ValueError(
                     f"CSV has too few columns: {df.shape[1]} < {expected_min_cols}"
@@ -404,44 +448,47 @@ class InitialSetup():
 
             # Extract data based on known layout
             # Expected:
-            # Input1..N | obj1..M | rms1..M | con1..K
+            # Input1..N | obj1..M | error1..M | con1..K
 
             X = df.iloc[:, 0:n_inputs].values
             Y_phys = df.iloc[:, n_inputs:n_inputs + n_obj].values
 
-            # RMS
-            rms_start = n_inputs + n_obj
-            rms_end = rms_start + n_obj
+            # error
+            error_start = n_inputs + n_obj
+            error_end = error_start + n_obj
 
-            if df.shape[1] >= rms_end:
-                RMS = df.iloc[:, rms_start:rms_end].values
+            if df.shape[1] >= error_end:
+                error = df.iloc[:, error_start:error_end].values
             else:
-                RMS = np.full(
+                error = np.full(
                     (len(df), n_obj),
-                    self.experiment.config.default_objective_rms,
+                    self.experiment.config.default_objective_error,
                     dtype=float
                 )
 
             # Constraints
-            con_start = rms_end
-            con_end = con_start + n_con
+            con_start = error_end
+            con_end = con_start + n_con 
+            pen_end = con_end+n_pen
 
-            if n_con > 0:
-                if df.shape[1] >= con_end:
-                    C = df.iloc[:, con_start:con_end].values
-                else:
-                    raise ValueError(
-                        "CSV missing constraint columns."
-                    )
-
-                _, CV = extract_Y_CV(
-                    np.hstack([Y_phys, C]),
-                    self.experiment.objectives_spec,
-                    self.experiment.constraints_spec,
-                    self.experiment.config.evaluation_method
-                )
+            if n_pen > 0:
+                pen_raw = df.iloc[:, con_end:pen_end].values
             else:
-                CV = np.zeros(len(X))
+                pen_raw = np.empty((len(df), 0), dtype=float)
+            if n_con > 0:
+                C = df.iloc[:, con_start:con_end].values
+            else:
+                C = np.empty((len(df), 0), dtype=float)
+
+            Y_pen, CV, C, V, Y_phys, penalty_raw, penalty_value, penalty_total = extract_Y_CV_details(
+                raw_outputs=Y_phys,
+                con_outputs=C,
+                objectives_spec=self.experiment.objectives_spec,
+                constraints_spec=self.experiment.constraints_spec,
+                method=self.experiment.config.evaluation_method,
+                penalty_outputs=pen_raw,
+                penalty_specs=self.experiment.config.penalties
+            )
 
             # Convert objectives (max → min)
             Y = Y_phys.copy()
@@ -459,13 +506,21 @@ class InitialSetup():
             self.input_pool = np.asarray(X, dtype=float)
             self.output_pool = np.asarray(Y, dtype=float)
             self.constraint_pool = np.asarray(CV, dtype=float)
-            self.rms_pool = np.asarray(RMS, dtype=float)
+            self.constraint_value_pool = np.asarray(C, dtype=float)
+            self.constraint_violation_pool = np.asarray(V, dtype=float)
+            self.error_pool = np.asarray(error, dtype=float)
+            self.penalty_raw_pool = np.asarray(penalty_raw, dtype=float)
+            self.penalty_value_pool = np.asarray(penalty_value, dtype=float)
+            self.penalty_total_pool = np.asarray(penalty_total, dtype=float)
 
             logger.info(
                 f"Loaded CSV: {len(self.input_pool)} rows, "
                 f"{self.input_pool.shape[1]} inputs, "
-                f"{self.output_pool.shape[1]} objectives"
+                f"{self.output_pool.shape[1]} objectives, "
+                f"{self.error_pool.shape[1]} stds, "
+                f"{np.shape(self.penalty_raw_pool)[0]} penalties"
             )
+            
 
             return
 
@@ -483,68 +538,73 @@ class InitialSetup():
 
         # Evaluate pool
         if hasattr(self.evaluator, "evaluate_batch"):
-            out = self.evaluator.evaluate_batch(X_pool)
-            raw_outputs = out[0]
-            aux = out[1] if (isinstance(out, (tuple, list)) and len(out) > 1) else None
+            raw_outputs, error_outputs, con_outputs, pen_raw_outputs = self.experiment.evaluator.evaluate_batch(X_pool)
         else:
             results = [self.evaluator.evaluate(x.reshape(1, -1)) for x in X_pool]
             raw_outputs = np.vstack([r[0].squeeze() for r in results])
+            rcon_outputs = np.vstack([r[2].squeeze() for r in results])
             aux = None
             if len(results) > 0 and isinstance(results[0], (tuple, list)) and len(results[0]) > 1:
                 aux = np.vstack([np.atleast_1d(r[1]).squeeze() for r in results])
 
-        # Objectives + constraints
-        Y_pool, CV_pool = extract_Y_CV(
-            raw_outputs,
-            objectives_spec=self.experiment.objectives_spec,
-            constraints_spec=self.experiment.constraints_spec,
-            method=self.experiment.config.evaluation_method,
-        )
 
-        # Extra constraint info
-        _, _, C_pool, V_pool, _ = extract_Y_CV_details(
+        Y_pen_pool, CV_pool, C_pool, V_pool, Y_phys_pool, penalty_raw_pool, penalty_value_pool, penalty_total_pool = extract_Y_CV_details(
             raw_outputs,
+            con_outputs,
             objectives_spec=self.experiment.objectives_spec,
             constraints_spec=self.experiment.constraints_spec,
             method=self.experiment.config.evaluation_method,
-        )
+            penalty_outputs=pen_raw_outputs,
+            penalty_specs=self.experiment.config.penalties)
 
         self.raw_pool = np.asarray(raw_outputs, dtype=float)
-        self.constraint_values_pool = np.asarray(C_pool, dtype=float)
-        self.constraint_violations_pool = np.asarray(V_pool, dtype=float)
+        self.experiment.constraint_pool = np.asarray(CV_pool, dtype=float)
+        self.experiment.constraint_values_pool = np.asarray(C_pool, dtype=float)
+        self.experiment.constraint_violations_pool = np.asarray(V_pool, dtype=float)
+        self.penalty_raw_pool = np.asarray(penalty_raw, dtype=float)
+        self.penalty_value_pool = np.asarray(penalty_value, dtype=float)
+        self.penalty_total_pool = np.asarray(penalty_total, dtype=float)
 
-        # RMS
-        default_rms = getattr(self.experiment.config, "default_objective_rms", 1e-3)
-        use_real_rms = getattr(self.experiment.config, "use_real_rms", True)
+        # error
+        default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+        use_real_error = getattr(self.experiment.config, "use_real_error", True)
 
         n_pool = X_pool.shape[0]
-        n_obj = Y_pool.shape[1]
+        n_obj = Y_phys_pool.shape[1]
 
-        RMS_pool = np.full((n_pool, n_obj), default_rms, dtype=float)
+        if use_real_error==False:
+            error_pool = np.full((n_pool, n_obj), default_error, dtype=float)
+        else:
+            error_pool = self.error_pool
 
-        if str(self.experiment.config.evaluation_method).upper() == "MANUAL" and use_real_rms and aux is not None:
+        if str(self.experiment.config.evaluation_method).upper() == "MANUAL" and use_real_error and aux is not None:
             aux_arr = np.asarray(aux, dtype=float)
             aux_arr = np.atleast_2d(aux_arr)
 
             if aux_arr.shape == (n_pool, n_obj):
-                RMS_pool = aux_arr
+                error_pool = aux_arr
             elif aux_arr.shape == (n_obj,):
-                RMS_pool[0, :] = aux_arr
+                error_pool[0, :] = aux_arr
 
         # Handle inf
         if self.reference_point is not None:
-            Y_pool = replace_inf_with_reference(Y_pool, self.reference_point)
+            Y_pen_pool = replace_inf_with_reference(Y_pen_pool, self.reference_point)
 
         # Store
         self.input_pool = X_pool
-        self.output_pool = np.atleast_2d(Y_pool)
+        self.output_pool = np.atleast_2d(Y_pen_pool)
         self.constraint_pool = np.asarray(CV_pool, dtype=float)
-        self.rms_pool = np.asarray(RMS_pool, dtype=float)
+        self.constraint_value_pool = np.asarray(C_pool, dtype=float)
+        self.constraint_violation_pool = np.asarray(V_pool, dtype=float)
+        self.error_pool = np.asarray(error_pool, dtype=float)
 
         logger.info(
             f"Generated pool: {len(self.input_pool)} rows, "
             f"{self.input_pool.shape[1]} inputs, "
-            f"{self.output_pool.shape[1]} objectives"
+            f"{self.output_pool.shape[1]} objectives, "
+            f"{self.error_pool.shape[1]} errors, "
+            f"{self.constraint_pool.shape[1]} constraints, "
+            f"{np.shape(self.penalty_raw_pool)[0]} penalties"
         )
 
 
@@ -581,19 +641,27 @@ class InitialSetup():
 
         Y0 = self.output_pool[chosen_idx, :]
         CV0 = self.constraint_pool[chosen_idx]
-        RMS0=self.rms_pool[chosen_idx]
+        C0 = self.constraint_value_pool[chosen_idx]
+        V0 = self.constraint_violation_pool[chosen_idx]
+        PEN0 = self.penalty_raw_pool[chosen_idx]
+        error0=self.error_pool[chosen_idx]
 
 
         # Store per-constraint values/violations + raw outputs for the chosen initial samples
         if hasattr(self, "constraint_values_pool"):
-            self.constraint_values_init = np.asarray(self.constraint_values_pool)[chosen_idx, :]
+            self.constraint_values_init = np.asarray(self.experiment.constraint_values_pool)[chosen_idx, :]
         else:
             self.constraint_values_init = np.empty((len(chosen_idx), 0), dtype=float)
 
         if hasattr(self, "constraint_violations_pool"):
-            self.constraint_violations_init = np.asarray(self.constraint_violations_pool)[chosen_idx, :]
+            self.constraint_violations_init = np.asarray(self.experiment.constraint_violations_pool)[chosen_idx, :]
         else:
             self.constraint_violations_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if hasattr(self, "penalty_raw_pool"):
+            self.penalty_init = np.asarray(self.experiment.penalty_raw_pool)[chosen_idx, :]
+        else:
+            self.penalty_init = np.empty((len(chosen_idx), 0), dtype=float)
 
         if hasattr(self, "raw_pool"):
             self.raw_init = np.asarray(self.raw_pool)[chosen_idx, :]
@@ -602,7 +670,9 @@ class InitialSetup():
         if self.reference_point is not None:
             Y0 = replace_inf_with_reference(Y0, self.reference_point)
 
-        return X0, Y0, CV0, RMS0
+        #print('c0: ',C0)
+
+        return X0, Y0, CV0, error0, C0, V0, PEN0
 
 
     def clamp_outputs_to_reference(self, Y: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -632,64 +702,111 @@ class InitialSetup():
     def _use_config_initial_samples(self):
         samples = self.experiment.config.initial_samples
 
-        X = np.array([s["X"] for s in samples], dtype=float)
-        Y = np.array([s["Y"] for s in samples], dtype=float)
+        n_obj = len(self.experiment.objectives_spec)
+        n_con = len(self.experiment.constraints_spec)
+        n_pen = len(self.experiment.penalties)
 
-        # Convert to minimisation space
+        X = np.asarray([s["X"] for s in samples], dtype=float)
+        Y_phys = np.asarray([s["Y"] for s in samples], dtype=float)
+
+        C = (
+            np.asarray(
+                [s["C"] if s.get("C") is not None else [np.nan] * n_con for s in samples],
+                dtype=float
+            )
+            if n_con > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        error = (
+            np.asarray(
+                [s["error"] if s.get("error") is not None else [self.experiment.config.default_objective_error] * n_obj for s in samples],
+                dtype=float
+            )
+            if n_obj > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        pen_raw = (
+            np.asarray(
+                [s["P"] if s.get("P") is not None else [0.0] * n_pen for s in samples],
+                dtype=float
+            )
+            if n_pen > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        Y_pen, CV, C, V, Y_phys, penalty_raw, penalty_value, penalty_total = extract_Y_CV_details(
+            raw_outputs=Y_phys,
+            con_outputs=C,
+            objectives_spec=self.experiment.objectives_spec,
+            constraints_spec=self.experiment.constraints_spec,
+            method=self.experiment.config.evaluation_method,
+            penalty_outputs=pen_raw,
+            penalty_specs=self.experiment.config.penalties
+        )
+
+        Y = Y_phys.copy()
         for j, o in enumerate(self.experiment.objectives_spec):
             if o["direction"] == "max":
                 Y[:, j] = -Y[:, j]
 
-        # Constraints → CV
-        if samples[0]["C"] is not None:
-            C = np.array([s["C"] for s in samples], dtype=float)
-            _, CV = extract_Y_CV(
-                np.hstack([Y, C]),
-                self.experiment.objectives_spec,
-                self.experiment.constraints_spec,
-                method="MANUAL"
-            )
-        else:
-            CV = np.zeros(len(X))
-
-        # RMS
-        if samples[0]["RMS"] is not None:
-            RMS = np.array([s["RMS"] for s in samples], dtype=float)
-        else:
-            RMS = np.full_like(Y, self.experiment.config.default_objective_rms)
-
         self.input_pool = X
         self.output_pool = Y
         self.constraint_pool = CV
-        self.rms_pool = RMS
+        self.constraint_value_pool = C
+        self.constraint_violation_pool = V
+        self.error_pool = error
+        self.penalty_raw_pool = penalty_raw
+        self.penalty_value_pool = penalty_value
+        self.penalty_total_pool = penalty_total
 
-        return X, Y, CV, RMS
+        return X, Y, CV, error, C, V, penalty_raw
 
     def run(self, no_of_init_samples: int = 10, ensure_min_distance: Optional[float] = None) -> InitialSetupResult:
         logger = logging.getLogger("InitialSetup")
-        print("input_columns:", self.input_columns)
-        print("n_inputs:", len(self.input_columns))
         self.load_and_clean()
 
         if self.csv_path and Path(self.csv_path).exists():
             self.load_and_clean()
             X_init = self.input_pool
             Y_init = self.output_pool
+            expected_n_obj = len(self.experiment.objectives_spec)
+
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
             CV_init = self.constraint_pool
-            RMS_init = self.rms_pool
+            C_init = self.constraint_value_pool
+            V_init = self.constraint_violation_pool
+            Pen_init = self.penalty_raw_pool
+            error_init = self.error_pool
             no_of_init_samples = len(Y_init)
 
         elif self.experiment.config.initial_samples:
-            X_init, Y_init, CV_init, RMS_init = self._use_config_initial_samples()
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init = self._use_config_initial_samples()
+            expected_n_obj = len(self.experiment.objectives_spec)
+
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
             no_of_init_samples = len(Y_init)
 
         else:
             self.load_and_clean()
-            X_init, Y_init, CV_init, RMS_init = self.choose_initial_samples(no_of_init_samples, ensure_min_distance=ensure_min_distance)
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init = self.choose_initial_samples(no_of_init_samples, ensure_min_distance=ensure_min_distance)
 
+            expected_n_obj = len(self.experiment.objectives_spec)
+
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
+        #print('c_init3: ',C_init)
         
         self.experiment.Y_init=Y_init
-        print(Y_init)
 
         pf, pf_idx = compute_pareto_front_constrained(Y_init, CV_init)
 
@@ -708,55 +825,70 @@ class InitialSetup():
         if Y_init.shape[1] == 3:
             self.plotter.plot_3obj_pareto_physical_axes(
                 Y_init, pf_idx, self.objective_names,
-                title=str(self.experiment.config.save_name) + "_3D_initial_PF"
+                title=str(self.experiment.config.working_dir) + "/Outputs/_3D_initial_PF"
             )
 
         # Reference point
         if self.reference_point is None:
             self.reference_point = np.max(self.output_pool, axis=0) + 1e6
             logger.info(f"No reference_point supplied; using default {self.reference_point}")
-
         Y_init = self.clamp_outputs_to_reference(Y_init, self.reference_point)
+        expected_n_obj = len(self.experiment.objectives_spec)
+
+        if Y_init.shape[1] != expected_n_obj:
+            raise ValueError(
+                f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                f"but config defines {expected_n_obj}"
+            )
 
         # Scaling
         if self.scale_data:
             self.input_scaler = StandardScaler().fit(self.input_pool)
             self.output_scaler = StandardScaler().fit(self.output_pool)
-            X_init_scaled = self.input_scaler.transform(X_init)
-            Y_init_scaled = self.output_scaler.transform(Y_init)
+            # X_init_scaled = self.input_scaler.transform(X_init)
+            # Y_init_scaled = self.output_scaler.transform(Y_init)
             logger.info("Input & output scalers fitted from pool (for GPs).")
         else:
             self.input_scaler = None
             self.output_scaler = None
-            X_init_scaled, Y_init_scaled = X_init, Y_init
+            # X_init_scaled, Y_init_scaled = X_init, Y_init
 
         # Build GP objects
+        # print(Y_init.shape[1])
         gp_models = self.build_gp_models(input_dim=X_init.shape[1], n_objectives=Y_init.shape[1])
 
-        #- RMS handling (real vs default)-
-        default_rms = getattr(self.experiment.config, "default_objective_rms", 1e-3)
-        use_real_rms = getattr(self.experiment.config, "use_real_rms", True)
+        #- error handling (real vs default)-
+        default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+        use_real_error = getattr(self.experiment.config, "use_real_error", True)
 
         # Guarantee shape (n_init, n_obj)
-        n_init, n_obj = Y_init.shape
-        if (not use_real_rms) or (RMS_init is None):
-            RMS_init = np.full((n_init, n_obj), default_rms, dtype=float)
+        n_init = X_init.shape[0]
+        self.experiment.iteration_repository = np.zeros(n_init, dtype=int)
+        for i in range(len(self.experiment.iteration_repository)):
+            self.experiment.iteration_repository[i]=-1
+        n_obj = Y_init.shape[1]
+        # print(n_obj)
+        if (not use_real_error) or (error_init is None):
+            error_init = np.full((n_init, n_obj), default_error, dtype=float)
         else:
-            RMS_init = np.asarray(RMS_init, dtype=float)
-            if RMS_init.shape != (n_init, n_obj):
-                # fall back safely
-                RMS_init = np.full((n_init, n_obj), default_rms, dtype=float)
-
-        # Store repositories on experiment (so optimiser can fit GPs with alpha=rms^2)
+            error_init = np.asarray(error_init, dtype=float)
+            if error_init.shape != (n_init, n_obj):
+                error_init = np.full((n_init, n_obj), default_error, dtype=float)
+        # Store repositories on experiment (so optimiser can fit GPs with alpha=error^2)
         self.experiment.input_repository = X_init
         self.experiment.output_repository = Y_init
-        self.experiment.constraint_repository = np.asarray(CV_init, dtype=float)
-        self.experiment.rms_repository = RMS_init
+        # self.experiment.constraint_repository = np.asarray(CV_init, dtype=float)
+        self.experiment.error_repository = error_init
 
         # Store full raw outputs + per-constraint values/violations for post-analysis
         self.experiment.raw_repository = getattr(self, "raw_init", np.empty((len(X_init), 0), dtype=float))
-        self.experiment.constraint_values_repository = getattr(self, "constraint_values_init", np.empty((len(X_init), 0), dtype=float))
-        self.experiment.constraint_violations_repository = getattr(self, "constraint_violations_init", np.empty((len(X_init), 0), dtype=float))
+        self.experiment.constraint_repository = np.asarray(CV_init).reshape(-1)
+        self.experiment.constraint_values_repository = np.asarray(C_init)
+        self.experiment.constraint_violations_repository = np.asarray(V_init)
+        self.experiment.penalty_raw_repository = np.asarray(Pen_init, dtype=float)
+        self.experiment.penalty_value_repository = np.asarray(self.penalty_value_pool[:len(X_init)], dtype=float)
+        self.experiment.penalty_total_repository = np.asarray(self.penalty_total_pool[:len(X_init)], dtype=float)
+        
 
         best_pf, best_idx = compute_pareto_front_constrained(self.output_pool, self.constraint_pool)
         init_pf, init_idx = compute_pareto_front_constrained(Y_init, CV_init)
@@ -786,14 +918,18 @@ class Optimiser(ABC):
         self.reference_point = experiment.reference_point
         self.input_repository = experiment.input_repository
         self.output_repository = experiment.output_repository
-        self.rms_repository = experiment.rms_repository
+        self.error_repository = experiment.error_repository
+        self.penalty_raw_repository = np.empty(0)
         self.input_bounds = experiment.config.input_bounds
         self.nu = experiment.config.nu
         self.gp_models = self._build_gp_models()
         self.beta = 2.5
         self.constraint_repository = self.experiment.constraint_repository
+        self.constraint_values_repository = self.experiment.constraint_values_repository
+        self.constraint_violations_repository = self.experiment.constraint_violations_repository
         self.config = experiment.config
         self.Y_init=self.experiment.Y_init
+        
 
 
 class BatchOptimiser(Optimiser):
@@ -807,7 +943,12 @@ class BatchOptimiser(Optimiser):
         self.input_repository = experiment.input_repository
         self.output_repository = experiment.output_repository
         self.constraint_repository = experiment.constraint_repository
-        self.rms_repository = experiment.rms_repository
+        self.constraint_values_repository = experiment.constraint_values_repository
+        self.constraint_violations_repository = experiment.constraint_violations_repository
+        self.error_repository = experiment.error_repository
+        self.penalty_value_repository = experiment.penalty_value_repository
+        self.penalty_total_repository = experiment.penalty_total_repository
+        self.multiprocess_bool=experiment.multiprocess_bool
 
         # Extra repositories for full post-analysis (per-constraint values/violations + raw outputs)
         self.constraint_values_repository = getattr(experiment, "constraint_values_repository", None)
@@ -821,6 +962,10 @@ class BatchOptimiser(Optimiser):
         self.beta = 2.5
         self.logger = logging.getLogger("MOBO_outputs")
         self.plotter = MOBOPlotter()
+        n_pen = len(self.experiment.penalties or [])
+        self.penalty_raw_repository = np.empty((0, n_pen), dtype=float)
+        self.penalty_value_repository = np.empty((0, n_pen), dtype=float)
+        self.penalty_total_repository = np.empty((0,), dtype=float)
 
         # GP length-scale history (saved each iteration for post-analysis)
         self.gp_length_scales_history = []  # list of (n_obj, n_dim) arrays
@@ -904,14 +1049,17 @@ class BatchOptimiser(Optimiser):
         state = {"iteration": iteration,
             "input_repository": self.input_repository,
             "output_repository": self.output_repository,
-            "rms_repository": self.rms_repository,
+            "error_repository": self.error_repository,
+            "penalty_raw_repository": self.penalty_raw_repository,
             "constraint_repository": self.constraint_repository,
+            "constraint_values_repository": self.constraint_values_repository,
+            "constraint_violaiton_repository": self.constraint_violations_repository,
             "hypervolume": self.HV,
             "GD": self.GD,
             "diversity": self.diversity,
             "Spacing": self.spacing,
             "count": self.count,
-            "gp_models": self.gp_models,  # Can be reloaded
+            "gp_models": self.gp_models, 
             "runtime": self.runtime_records,
             "gp_length_scales_history": getattr(self, "gp_length_scales_history", []),
             "cv_gp_length_scales_history": getattr(self, "cv_gp_length_scales_history", []),
@@ -931,9 +1079,16 @@ class BatchOptimiser(Optimiser):
         self.input_repository = state["input_repository"]
         self.output_repository = state["output_repository"]
         self.constraint_repository = state.get("constraint_repository", None)
-        self.rms_repository = state.get("rms_repository", None)
+        self.constraint_values_repository = state.get("constraint_values_repository", None)
+        self.constraint_violations_repository = state.get("constraint_violations_repository", None)
+        self.error_repository = state.get("error_repository", None)
+        self.penalty_raw_repository = state.get("penalty_raw_repository",None)
         if self.constraint_repository is not None:
             self.experiment.constraint_repository = self.constraint_repository
+        if self.constraint_values_repository is not None:
+            self.experiment.constraint_values_repository = self.constraint_values_repository
+        if self.constraint_violations_repository is not None:
+            self.experiment.constraint_violations_repository = self.constraint_violations_repository
         self.HyperV = state['hypervolume']
         self.GD = state['GD']
         self.Diversity = state['diversity']
@@ -957,7 +1112,11 @@ class BatchOptimiser(Optimiser):
                 self.experiment.input_repository = self.input_repository
                 self.experiment.output_repository = self.output_repository
                 self.experiment.constraint_repository = self.constraint_repository
-                self.experiment.rms_repository = self.rms_repository
+                self.experiment.constraint_values_repository = self.constraint_values_repository
+                self.experiment.constraint_violations_repository = self.constraint_violations_repository
+                self.experiment.error_repository = self.error_repository
+                self.experiment.penalty_raw_repository = self.penalty_raw_repository
+                
 
                 # Optional: truncate history and restart from a specific iteration (0-based) (use restart=True to resume from the last completed iteration).
                 #ri = getattr(self.config, "restart_from_iteration", None)
@@ -975,14 +1134,25 @@ class BatchOptimiser(Optimiser):
                         self.input_repository = self.input_repository[:n_keep]
                         self.output_repository = self.output_repository[:n_keep]
                         if self.constraint_repository is not None:
-                            self.constraint_repository = np.asarray(self.constraint_repository)[:n_keep]
-                        if self.rms_repository is not None:
-                            self.rms_repository = np.asarray(self.rms_repository)[:n_keep]
+                            self.constraint_repository = np.asarray(self.constraint_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
+                        if self.constraint_values_repository is not None:
+                            self.constraint_values_repository = np.asarray(self.constraint_values_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
+                        if self.constraint_violations_repository is not None:
+                            self.constraint_violations_repository = np.asarray(self.constraint_violations_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
+                        if self.error_repository is not None:
+                            self.error_repository = np.asarray(self.error_repository)[:n_keep]
+                        if self.penalty_raw_repository is not None:
+                            self.penatly_repository = np.asarray(self.penalty_raw_repository)[:n_keep]
 
                         self.experiment.input_repository = self.input_repository
                         self.experiment.output_repository = self.output_repository
                         self.experiment.constraint_repository = self.constraint_repository
-                        self.experiment.rms_repository = self.rms_repository
+                        self.experiment.constraint_values_repository = self.constraint_values_repository
+                        self.experiment.constraint_violations_repository = self.constraint_violations_repository
+                        self.experiment.error_repository = self.error_repository
+                        self.experiment.penalty_raw_repository = np.vstack([self.penalty_raw_repository, penalty_outputs_new])
+                        self.experiment.penalty_value_repository = np.vstack([self.penalty_value_repository, P_new])
+                        self.experiment.penalty_total_repository = np.hstack([self.penalty_total_repository, total_penalty_new])
 
                         # metrics history (if present)
                         if isinstance(getattr(self, "HyperV", None), list):
@@ -1040,22 +1210,27 @@ class BatchOptimiser(Optimiser):
 
         for i in range(start_iter, self.iterations):
             start = time.perf_counter()
+            iter_col = np.full(self.input_repository.shape[0], i+1, dtype=int)
+            self.experiment.iteration_repository = np.hstack([self.experiment.iteration_repository, i])
             
             acq = AcquisitionFactory.create(self.aq, beta=self.config.nu, weights=self.weight, reference_point=self.experiment.reference_point, n_samples=5000)
 
             # Fit Gaussian Processes
             logging.info(f"Iteration {i} - Fitting GP")
-            default_rms = getattr(self.experiment.config, "default_objective_rms", 1e-3)
+            default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
 
+            print(self.output_repository)
+            
             for j, gp in enumerate(self.gp_models):
                 y = self.output_repository[:, j]
 
-                if hasattr(self, "rms_repository") and self.rms_repository.shape[0] == len(y):
-                    rms = self.rms_repository[:, j]
+                if hasattr(self, "error_repository") and self.error_repository.shape[0] == len(y):
+                    # print(self.error_repository)
+                    error = self.error_repository[:, j]
                 else:
-                    rms = np.full_like(y, default_rms, dtype=float)
+                    error = np.full_like(y, default_error, dtype=float)
 
-                alpha = np.clip(rms**2, 1e-12, np.inf)   # variance, avoid zeros
+                alpha = np.clip(error**2, 1e-12, np.inf)   # variance, avoid zeros
                 gp.alpha = alpha
                 gp.fit(self.input_repository, y) # Fit the GP models to the available data
 
@@ -1124,32 +1299,34 @@ class BatchOptimiser(Optimiser):
                 except Exception as e:
                     logging.warning(f'Acquisition plotting failed: {e}')
 
-            raw_new, rms_new = self.experiment.evaluator.evaluate_batch(X_new)
-            Y_new, CV_new = extract_Y_CV(raw_new, objectives_spec=self.experiment.objectives_spec, constraints_spec=self.experiment.constraints_spec, method=self.experiment.config.evaluation_method)
-
-            # Also keep per-constraint values/violations + raw outputs for every evaluated point
-            _, _, C_new, V_new, _ = extract_Y_CV_details(
-                raw_new,
-                objectives_spec=self.experiment.objectives_spec,
-                constraints_spec=self.experiment.constraints_spec,
-                method=self.experiment.config.evaluation_method,
-            )
-
-            if self.evaluation_method=='ASTRA':              
-                try:
-                    run = subprocess.call('rm Astra_files/Astra_3_obj_EL_*', shell=True)
-                    run = subprocess.call('rm Astra_files/3_obj_EL_*', shell=True)
-                except:
-                    print(f'I have not been able to delete run files')
+            raw_new, error_new, con_new, pen_raw_new = self.experiment.evaluator.evaluate_batch(X_new)
+            # Y_new, CV_new, C_new, V_new, Y_phys_new, Y_pen_new = extract_Y_CV_details(raw_new, con_new, objectives_spec=self.experiment.objectives_spec, constraints_spec=self.experiment.constraints_spec, method=self.experiment.config.evaluation_method, penalty_specs=self.experiment.config.penalties)
+            Y_pen_new, CV_new, C_new, V_new, Y_phys_new, penalty_outputs_new, P_new, total_penalty_new = extract_Y_CV_details(
+                    raw_new, con_new,
+                    objectives_spec=self.experiment.objectives_spec,
+                    constraints_spec=self.experiment.constraints_spec,
+                    method=self.experiment.config.evaluation_method,
+                    penalty_specs=self.experiment.config.penalties,
+                    penalty_outputs=pen_raw_new
+                )
 
             labels = [o["name"] for o in self.experiment.objectives_spec]
 
             
             # Add to repositories
             self.experiment.input_repository = np.vstack([self.input_repository, X_new])
+            Y_new = Y_phys_new.copy()
+            for j, o in enumerate(self.experiment.objectives_spec):
+                if o["direction"] == "max":
+                    Y_new[:,j]=-Y_new[:,j]
             self.experiment.output_repository = np.vstack([self.output_repository, Y_new])
             self.experiment.constraint_repository = np.hstack([self.constraint_repository, CV_new])
-            self.experiment.rms_repository = np.vstack([self.rms_repository,rms_new])
+            self.experiment.constraint_values_repository = np.vstack([self.constraint_values_repository, C_new])
+            self.experiment.constraint_violations_repository = np.vstack([self.constraint_violations_repository, V_new])
+            self.experiment.error_repository = np.vstack([self.error_repository,error_new])
+            self.experiment.penalty_raw_repository = np.vstack([self.experiment.penalty_raw_repository,penalty_outputs_new])
+            self.experiment.penalty_value_repository = np.vstack([self.experiment.penalty_value_repository, P_new])
+            self.experiment.penalty_total_repository = np.hstack([self.experiment.penalty_total_repository, total_penalty_new])
 
 
             # Append extra repositories (raw outputs + per-constraint info)
@@ -1161,25 +1338,15 @@ class BatchOptimiser(Optimiser):
             except Exception:
                 pass
 
-            try:
-                if getattr(self.experiment, "constraint_values_repository", None) is None or np.size(getattr(self.experiment, "constraint_values_repository", np.empty((0,0)))) == 0:
-                    self.experiment.constraint_values_repository = np.asarray(C_new, dtype=float)
-                else:
-                    self.experiment.constraint_values_repository = np.vstack([self.experiment.constraint_values_repository, np.asarray(C_new, dtype=float)])
-            except Exception:
-                pass
 
-            try:
-                if getattr(self.experiment, "constraint_violations_repository", None) is None or np.size(getattr(self.experiment, "constraint_violations_repository", np.empty((0,0)))) == 0:
-                    self.experiment.constraint_violations_repository = np.asarray(V_new, dtype=float)
-                else:
-                    self.experiment.constraint_violations_repository = np.vstack([self.experiment.constraint_violations_repository, np.asarray(V_new, dtype=float)])
-            except Exception:
-                pass
             self.input_repository = self.experiment.input_repository
             self.output_repository = self.experiment.output_repository
             self.constraint_repository = self.experiment.constraint_repository
-            self.rms_repository = self.experiment.rms_repository
+            self.constraint_values_repository = self.experiment.constraint_values_repository
+            self.constraint_violations_repository = self.experiment.constraint_violations_repository
+            self.constraint_values_repository = self.experiment.constraint_values_repository
+            self.constraint_violations_repository = self.experiment.constraint_violations_repository
+            self.error_repository = self.experiment.error_repository
 
             self.constraint_values_repository = getattr(self.experiment, "constraint_values_repository", None)
             self.constraint_violations_repository = getattr(self.experiment, "constraint_violations_repository", None)
@@ -1191,12 +1358,13 @@ class BatchOptimiser(Optimiser):
             # Update metrics 
             pf, pf_idx = compute_pareto_front_constrained(self.output_repository, self.experiment.constraint_repository)
             pf_input = self.input_repository[pf_idx]
-            pf_rms = self.rms_repository[pf_idx]
+            pf_error = self.error_repository[pf_idx]
             hv = Metrics.hypervolume(pf, self.experiment.reference_point)
             gd = Metrics.generational_distance(pf, self.experiment.best_pareto_front)
             div = Metrics.diversity(pf)
             spacing = Metrics.spacing(pf)
             count = Metrics.num_pf_points(pf)
+            goal_kwargs_json = json.dumps(self.experiment.config.goal_function_kwargs, sort_keys=True, default=str)
             HyperV.append(hv)
             GD.append(gd)
             Diversity.append(div)
@@ -1215,7 +1383,7 @@ class BatchOptimiser(Optimiser):
             labels = [o["name"] for o in self.experiment.objectives_spec]
             directions = [o["direction"] for o in self.experiment.objectives_spec]
             self.plotter.plot_pareto_front_colourmap(Y_init=self.experiment.Y_init,Y=self.output_repository,pf_idx=pf_idx,objective_labels=labels,objective_directions=directions,save_name=self.experiment.config.save_name,CV=self.experiment.constraint_repository)
-            self.plotter.plot_3obj_pareto_physical_axes(self.output_repository, pf_idx, labels, title=str(self.experiment.config.save_name)+'_3D_initial_PF')
+            # self.plotter.plot_3obj_pareto_physical_axes(self.output_repository, pf_idx, labels, title=str(self.experiment.config.working_dir)+'/Outputs/3D_initial_PF')
             self.plotter.plot_hypervolume_evolution(self.HV, self.evaluation_method,  str(_get_outputs_dir(self.config)) + "/", i, self.config.save_name)
 
             self.logger.info(f"Iter {i}: HV={hv:.3f}, X_new={len(X_new)} new points")
@@ -1225,43 +1393,51 @@ class BatchOptimiser(Optimiser):
                 pass
             self.save_checkpoint(i + 1, str(_get_benchmarks_dir(self.config) / f"{save_name}.pkl"))
 
-            # # Terminate on hypervolume value
-            # if self.config.terminate_on_hv:
-            #     pf, pf_idx = compute_pareto_front_constrained(self.output_repository, self.experiment.constraint_repository)
-            #     pf_input = self.input_repository[pf_idx]
-            #     HV_current = Metrics.hypervolume(pf, self.experiment.reference_point)
-            #     HV_best = Metrics.hypervolume(self.experiment.best_pareto_front, self.experiment.reference_point)
-                
-            #     if HV_current >= HV_best - 1e-6:
-            #         print(f"[Termination] HV {HV_current:.6f} reached/exceeded best {HV_best:.6f}.")
-            #         break
-            #     else:
-            #         print(f"[Termination] HV {HV_current:.6f} < {HV_best:.6f}.")
+        
 
         labels = [o["name"] for o in self.experiment.objectives_spec]
 
+        Samples = np.asarray(self.input_repository)
+        Objectives = np.asarray(self.output_repository)
+        error_values = np.asarray(self.error_repository)
+        C_values = np.asarray(self.constraint_values_repository)
+        V_values = np.asarray(self.constraint_violations_repository)
+        CV_values = np.asarray(self.constraint_repository).reshape(-1, 1)
+        it = np.asarray(self.experiment.iteration_repository).reshape(-1, 1)
+        penalty_raw_values = np.asarray(self.experiment.penalty_raw_repository, dtype=float)
+        penalty_processed_values = np.asarray(self.experiment.penalty_value_repository, dtype=float)
+        penalty_total_values = np.asarray(self.experiment.penalty_total_repository, dtype=float).reshape(-1, 1)
 
-        return {"pareto_front": pf,
-            "pareto_front_inputs": pf_input,
-            "pareto_front_rms": pf_rms,
-            "hypervolume": HyperV,
-            "generational_distance": GD,
-            "diversity": Diversity,
-            "spacing": Spacing,
-            "num_pf_points": Count,
-            "timed_iterations": runtime_records,
-            "X_repo": self.input_repository,
-            "Y_repo": self.output_repository,
-            "CV_repo": self.experiment.constraint_repository,
-            "rms_repo": self.experiment.rms_repository,
-            "constraint_values_repo": getattr(self.experiment, "constraint_values_repository", np.empty((0,0))),
-            "constraint_violations_repo": getattr(self.experiment, "constraint_violations_repository", np.empty((0,0))),
-            "raw_repo": getattr(self.experiment, "raw_repository", np.empty((0,0))),
-            "gp_length_scales_repo": (np.asarray(self.gp_length_scales_history, dtype=float).reshape(len(self.gp_length_scales_history), -1)
-                                     if getattr(self, "gp_length_scales_history", []) else np.empty((0,0))),
-            "cv_gp_length_scales_repo": (np.asarray(self.cv_gp_length_scales_history, dtype=float)
-                                        if getattr(self, "cv_gp_length_scales_history", []) else np.empty((0,0)))}
+        raw_repo = np.hstack([
+            it,
+            Samples,
+            Objectives,
+            error_values,
+            C_values,
+            V_values,
+            CV_values,
+            penalty_raw_values,
+            penalty_processed_values,
+            penalty_total_values
+        ])
 
+        metrics_repo = []
+        for j in range(len(HyperV)):
+            metrics_repo.append({
+                "Iteration": int(it[len(it) - len(HyperV) + j].reshape(-1)[0]),
+                "Hypervolume": float(HyperV[j]),
+                "Generational_Distance": float(GD[j]),
+                "Diversity": float(Diversity[j]),
+                "Spacing": float(Spacing[j]),
+                "PF Count": int(Count[j]),
+                "Runtime": float(runtime_records[j]),
+                "Goal_func_kwargs": goal_kwargs_json,
+            })
+
+        return {"raw_repo": raw_repo,
+                "gp_models": self.gp_models,
+                "cv_gp_model": getattr(self, "cv_gp_model", None),
+                "metrics_repo": metrics_repo}
 
 class Acquisition(ABC):
     @abstractmethod
@@ -1407,14 +1583,14 @@ class InteractiveEvaluator(EvaluatorBase):
         input("\nPress ENTER once measurement is complete...")
 
         Y_obj = []
-        Y_rms = []
+        Y_error = []
 
         print("\nEnter objective values:")
         for obj in self.objectives:
             v = self._ask_float(f"  {obj['name']} value: ")
-            r = self._ask_float(f"  {obj['name']} RMS  : ")
+            r = self._ask_float(f"  {obj['name']} error  : ")
             Y_obj.append(v)
-            Y_rms.append(r)
+            Y_error.append(r)
 
         Y_con = []
         if self.constraints:
@@ -1424,15 +1600,16 @@ class InteractiveEvaluator(EvaluatorBase):
                 Y_con.append(v)
 
         Y_all = np.array(Y_obj + Y_con, dtype=float)
-        return Y_all, np.array(Y_rms, dtype=float).reshape(1, -1)
+        return Y_obj, np.array(Y_error, dtype=float).reshape(1, -1), Y_con
 
     def evaluate_batch(self, X):
-        Ys, Yrms = [], []
+        Ys, Yerror, Yc = [], [], []
         for x in X:
-            y, r = self.evaluate(x.reshape(1, -1))
+            y, r, c = self.evaluate(x.reshape(1, -1))
             Ys.append(y)
-            Yrms.append(r[0])
-        return np.array(Ys, dtype=float), np.array(Yrms, dtype=float)
+            Yerror.append(r)
+            Yc.append(c)
+        return np.array(Ys, dtype=float), np.array(Yerror, dtype=float), np.array(Yc)
 
 
 class GoalFunctionEvaluator(EvaluatorBase):
@@ -1444,17 +1621,23 @@ class GoalFunctionEvaluator(EvaluatorBase):
         inputs,
         objectives_spec,
         constraints_spec,
-        default_objective_rms: float = 1e-3,
+        penalties_spec=None,
+        default_objective_error: float = 1e-3,
         goal_function_path=None,
         goal_function_name="goal_function",
+        goal_function_kwargs=None,
+        multiprocess_bool=False
     ):
         self.goal_fn = goal_fn
         self.goal_function_path = goal_function_path
         self.goal_function_name = goal_function_name
+        self.goal_function_kwargs = goal_function_kwargs
         self.inputs = inputs
         self.objectives_spec = objectives_spec
         self.constraints_spec = constraints_spec or []
-        self.default_objective_rms = float(default_objective_rms)
+        self.penalties_spec = penalties_spec or []
+        self.default_objective_error = float(default_objective_error)
+        self.multiprocess_bool=multiprocess_bool
 
     def _coerce_vec(self, v, expected_len, name):
         arr = np.asarray(v, dtype=float).reshape(-1)
@@ -1464,44 +1647,43 @@ class GoalFunctionEvaluator(EvaluatorBase):
             )
         return arr
 
-    def _coerce_rms(self, rms, n_obj, n_con):
-        if rms is None:
-            return np.full(n_obj, self.default_objective_rms, dtype=float)
+    def _coerce_error(self, error, n_obj, n_con, n_pen):
+        if error is None:
+            return np.full(n_obj, self.default_objective_error, dtype=float)
 
-        r = np.asarray(rms, dtype=float).reshape(-1)
+        r = np.asarray(error, dtype=float).reshape(-1)
 
         if r.size == n_obj:
             return np.clip(r, 0.0, None)
 
         if (n_obj + n_con) and r.size == (n_obj + n_con):
             return np.clip(r[:n_obj], 0.0, None)
+        
+        if (n_obj + n_con + n_pen) and r.size == (n_obj + n_con + n_pen):
+            return np.clip(r[:n_obj+n_con], 0.0, None)
 
-        if n_con and r.size == n_con:
-            return np.full(n_obj, self.default_objective_rms, dtype=float)
+        # if n_con and r.size == n_con:
+        #     return np.full(n_obj, self.default_objective_error, dtype=float)
 
         raise ValueError(
-            f"Goal function RMS length {r.size} does not match "
-            f"n_obj={n_obj}, n_con={n_con}, or n_obj+n_con={n_obj+n_con}."
+            f"Goal function error length {r.size} does not match "
+            f"n_obj={n_obj}, n_obj+n_con={n_obj+n_con}, or n_obj+n_con+n_pen={n_obj+n_con+n_pen}."
         )
 
     @staticmethod
     def _evaluate_single(args):
-        (
-            i,
-            x,
-            X,
+        (   x,
             goal_function_path,
             goal_function_name,
-            inputs,
+            goal_function_kwargs,
             objectives_spec,
             constraints_spec,
-            default_objective_rms,
+            penalty,
+            default_objective_error,
         ) = args
 
         import importlib
         import importlib.util
-        import os
-        import numpy as np
 
         # Load goal function inside worker
         if str(goal_function_path).endswith(".py") and os.path.exists(str(goal_function_path)):
@@ -1517,6 +1699,7 @@ class GoalFunctionEvaluator(EvaluatorBase):
 
         n_obj = len(objectives_spec)
         n_con = len(constraints_spec)
+        n_pen = len(penalty)
 
         def _coerce_vec(v, expected_len, name):
             arr = np.asarray(v, dtype=float).reshape(-1)
@@ -1526,88 +1709,68 @@ class GoalFunctionEvaluator(EvaluatorBase):
                 )
             return arr
 
-        def _coerce_rms(rms):
-            if rms is None:
-                return np.full(n_obj, default_objective_rms, dtype=float)
+        def _coerce_error(error):
+            if error is None:
+                return np.full(n_obj, default_objective_error, dtype=float)
 
-            r = np.asarray(rms, dtype=float).reshape(-1)
+            r = np.asarray(error, dtype=float).reshape(-1)
 
             if r.size == n_obj:
                 return np.clip(r, 0.0, None)
 
             if (n_obj + n_con) and r.size == (n_obj + n_con):
                 return np.clip(r[:n_obj], 0.0, None)
+            
+            if (n_obj + n_con + n_pen) and r.size == (n_obj + n_con + n_pen):
+                return np.clip(r[:n_obj], 0.0, None)
 
-            if n_con and r.size == n_con:
-                return np.full(n_obj, default_objective_rms, dtype=float)
+            # if n_con and r.size == n_con:
+            #     return np.full(n_obj, default_objective_error, dtype=float)
 
             raise ValueError(
-                f"Goal function RMS length {r.size} does not match "
-                f"n_obj={n_obj}, n_con={n_con}, or n_obj+n_con={n_obj+n_con}."
+                f"Goal function error length {r.size} does not match "
+                f"n_obj={n_obj}, n_con={n_con}, n_obj+n_con={n_obj+n_con}, or n_obj+n_con+n_pen={n_obj+n_con+n_pen}."
             )
 
-        inputs_dict = {
-            inp.get("name", f"x{j}"): float(val)
-            for j, (inp, val) in enumerate(zip(inputs, x))
-        }
 
-        res = goal_fn(x, X=X[i:i + 1], inputs=inputs_dict)
+        res = goal_fn(x.reshape(1,-1), **(goal_function_kwargs or {}))
 
-        penalty = None
+        pens = None
         objs = None
         cons = None
-        rms = None
+        error = None
         raw = None
 
         if isinstance(res, dict):
             raw = res.get("raw", None)
             objs = res.get("objectives", res.get("objs", None))
             cons = res.get("constraints", res.get("cons", None))
-            rms = res.get("rms", None)
-            penalty = res.get("penalty", None)
-
-        elif isinstance(res, (tuple, list)):
-            if len(res) == 3:
-                objs, cons, rms = res
-            elif len(res) == 2:
-                objs, cons = res
-            elif len(res) == 1:
-                penalty = res[0]
-            else:
-                raise ValueError(
-                    "Goal function must return (objs, cons) or (objs, cons, rms), "
-                    "a dict, or a scalar penalty."
-                )
-        else:
-            penalty = res
+            error = res.get("errors", None)
+            pens = res.get("penalties", None)
 
         if raw is not None:
             raw_arr = np.asarray(raw, dtype=float).reshape(-1)
-            if raw_arr.size != (n_obj + n_con):
+            if raw_arr.size != n_obj:
                 raise ValueError(
-                    f"Goal function returned raw length {raw_arr.size}, expected {n_obj+n_con}."
+                    f"Goal function returned raw length {raw_arr.size}, expected {n_obj}."
                 )
-
-        elif penalty is not None:
-            if n_con > 0:
-                raise ValueError(
-                    "Goal function returned scalar penalty but constraints exist in config."
-                )
-            p = float(penalty)
-            raw_arr = np.full(n_obj, p, dtype=float)
-
         else:
-            objs_arr = _coerce_vec(objs, n_obj, "objectives")
-            cons_arr = (
-                _coerce_vec(cons if cons is not None else np.zeros(n_con), n_con, "constraints")
-                if n_con
-                else np.asarray([], dtype=float)
-            )
-            raw_arr = np.concatenate([objs_arr, cons_arr])
+            raw_arr = _coerce_vec(objs, n_obj, "objectives")
 
-        rms_arr = _coerce_rms(rms)
+        cons_arr = (
+            _coerce_vec(cons if cons is not None else np.zeros(n_con), n_con, "constraints")
+            if n_con
+            else np.asarray([], dtype=float)
+        )
 
-        return raw_arr, rms_arr
+        pen_arr = (
+            _coerce_vec(pens if pens is not None else np.zeros(n_pen), n_pen, "penalties")
+            if n_pen
+            else np.asarray([], dtype=float)
+        )
+
+        error_arr = _coerce_error(error)
+        return raw_arr, error_arr, cons_arr, pen_arr
 
     def evaluate_batch(self, X: np.ndarray):
         X = np.asarray(X, dtype=float)
@@ -1617,38 +1780,44 @@ class GoalFunctionEvaluator(EvaluatorBase):
 
         args = [
             (
-                i,
                 X[i],
-                X,
                 self.goal_function_path,
                 self.goal_function_name,
-                self.inputs,
+                self.goal_function_kwargs,
                 self.objectives_spec,
                 self.constraints_spec,
-                self.default_objective_rms,
+                self.penalties_spec,
+                self.default_objective_error,
             )
             for i in range(n_batch)
         ]
 
-        with Pool(processes=os.cpu_count()) as pool:
-            results = pool.map(self._evaluate_single, args)
+        if self.multiprocess_bool==True:
+            with Pool(processes=os.cpu_count()) as pool:
+                results = pool.map(self._evaluate_single, args)
+        if self.multiprocess_bool==False:
+            results=[]
+            for i in range(len(X)):
+                results.append(self._evaluate_single(args[i]))
 
-        raw_rows, rms_rows = zip(*results)
+        raw_rows, error_rows, con_rows, pen_rows = zip(*results)
 
         raw_new = np.vstack(raw_rows).astype(float)
-        rms_new = np.vstack(rms_rows).astype(float)
+        error_new = np.vstack(error_rows).astype(float)
+        con_new = np.vstack(con_rows).astype(float) if len(self.constraints_spec) else np.empty((n_batch, 0))
+        pen_new = np.vstack(pen_rows).astype(float) if len(self.penalties_spec) else np.empty((n_batch, 0))
 
-        return raw_new, rms_new
+        return raw_new, error_new, con_new, pen_new
 
     def evaluate(self, X: np.ndarray):
-        raw, rms = self.evaluate_batch(X)
-        return raw, rms
+        raw, error, con, pen = self.evaluate_batch(X)
+        return raw, error, con, pen
     
 
 
 class EvaluatorFactory:
     @staticmethod
-    def create(method: str, model_path=None, **kwargs) -> EvaluatorBase:
+    def create(method: str, **kwargs) -> EvaluatorBase:
         method = method.upper()
         if method == "MANUAL":
             inputs = kwargs["inputs"]
@@ -1660,7 +1829,10 @@ class EvaluatorFactory:
             # Load goal function from a module path or .py file path
             goal_path = kwargs.get("goal_function_path", "")
             goal_name = kwargs.get("goal_function_name", "goal_function")
-            default_rms = kwargs.get("default_objective_rms", 1e-3)
+            default_error = kwargs.get("default_objective_error", 1e-3)
+            multiprocess = kwargs.get("multiprocess_bool", False)
+            penalties_spec = kwargs.get("penalties", [])
+            goal_function_kwargs = kwargs.get("goal_function_kwargs", None)
 
             if not goal_path:
                 raise ValueError("GOAL evaluation requires goal_function_path in config")
@@ -1687,9 +1859,12 @@ class EvaluatorFactory:
                 inputs=kwargs["inputs"],
                 objectives_spec=kwargs.get("objectives_spec") or kwargs.get("objectives"),
                 constraints_spec=kwargs.get("constraints_spec") or kwargs.get("constraints", []),
-                default_objective_rms=default_rms,
+                default_objective_error=default_error,
                 goal_function_path=goal_path,
-                goal_function_name=goal_name)
+                goal_function_name=goal_name,
+                goal_function_kwargs= kwargs.get("goal_function_kwargs"),
+                multiprocess_bool=multiprocess,
+                penalties_spec=penalties_spec)
         else:
             raise ValueError(f"Unknown evaluation method: {method}")
 
@@ -1820,7 +1995,7 @@ class MOBOPlotter:
         plt.legend()
         plt.tight_layout()
         plt.savefig(str(Path(os.getcwd()) / f"{title}.png"))
-        plt.show()
+        # plt.show()
 
     def plot_pareto_front_colourmap(self, Y_init, Y, pf_idx, objective_labels, objective_directions, save_name, CV=None, ax=None, cmap="viridis"):
         """
@@ -1929,7 +2104,7 @@ class MOBOPlotter:
     input_specs,   
     X_train,
     Y_train,
-    RMS_train=None,
+    error_train=None,
     CV_train=None,
     labels=None,
     iteration=None,
@@ -1938,11 +2113,13 @@ class MOBOPlotter:
     order="input0_slowest",
     two_sigma=2.0,
     feasible_tol=0.0,
-    default_objective_rms=1e-3,
+    default_objective_error=1e-3,
     next_index=None,
     save_path=None,
     show=False,
     max_candidates=None):
+        print('GP plotting')
+        print(error_train)
         if save_path==None:
             save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_over_inputs_iter_{iteration}.png")
             save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_over_inputs.png")
@@ -1972,18 +2149,18 @@ class MOBOPlotter:
         #Map training points to grid indices
         train_idx = map_points_to_grid_index(X_train, X_grid)
 
-        # RMS and scaling consistency
+        # error and scaling consistency
         Y_train = np.asarray(Y_train, float)
-        if RMS_train is None:
-            RMS_train = np.full_like(Y_train, float(default_objective_rms))
+        if error_train is None:
+            error_train = np.full_like(Y_train, float(default_objective_error))
         else:
-            RMS_train = np.asarray(RMS_train, float)
+            error_train = np.asarray(error_train, float)
 
         Y_plot = Y_train.copy()
-        RMS_plot = RMS_train.copy()
+        error_plot = error_train.copy()
         if output_scaler is not None:
             Y_plot = Y_plot * output_scaler.scale_ + output_scaler.mean_
-            RMS_plot = RMS_plot * output_scaler.scale_
+            error_plot = error_plot * output_scaler.scale_
 
         #Feasibility mask
         if CV_train is None:
@@ -2012,22 +2189,22 @@ class MOBOPlotter:
             ax.fill_between(x_idx[::1000], mu[j][::1000] - two_sigma * std[j][::1000], mu[j][::1000] + two_sigma * std[j][::1000], color=c, alpha=0.15)
 
             y = Y_plot[:, j]
-            rms = RMS_plot[:, j]
-            rms = np.clip(np.asarray(rms, dtype=float), 0.0, None)
+            error = error_plot[:, j]
+            error = np.clip(np.asarray(error, dtype=float), 0.0, None)
 
             if np.any(infeasible):
                 ax.errorbar(
-                    train_idx[infeasible], y[infeasible], yerr=rms[infeasible],
+                    train_idx[infeasible], y[infeasible], yerr=error[infeasible],
                     fmt='o', markersize=4, capsize=2, elinewidth=1,
                     color='0.6', ecolor='0.6', alpha=0.8,
-                    label="measured infeasible ±RMS" if j == 0 else None
+                    label="measured infeasible ±error" if j == 0 else None
                 )
             if np.any(feasible):
                 ax.errorbar(
-                    train_idx[feasible], y[feasible], yerr=rms[feasible],
+                    train_idx[feasible], y[feasible], yerr=error[feasible],
                     fmt='o', markersize=4, capsize=2, elinewidth=1,
                     color=c, ecolor=c, alpha=0.9,
-                    label="measured feasible ±RMS" if j == 0 else None
+                    label="measured feasible ±error" if j == 0 else None
                 )
 
         if next_index is not None:
@@ -2041,17 +2218,18 @@ class MOBOPlotter:
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
             fig.savefig(save_path, dpi=150, bbox_inches="tight")
-            fig.savefig(save, dpi=150, bbox_inches="tight")
+            # fig.savefig(save, dpi=150, bbox_inches="tight")
             print(f"[plot_gp_models_over_discrete_grid] saved -> {save_path}")
 
-        if show:
-            plt.show()
-        plt.close(fig)
+        # if show:
+        #     plt.show()
+        print(f'Saving gp models to {save_path}')
+        plt.savefig(save_path, dpi=200)
 
         return X_grid
 
 
-    def plot_everything_with_rms(self,
+    def plot_everything_with_error(self,
         Iteration,
         gp_models,
         X_candidates,              
@@ -2070,12 +2248,12 @@ class MOBOPlotter:
         UCB_penalised=None,
         X_train=None,                
         Y_train=None,                
-        RMS_train=None,             
-        default_objective_rms=1e-3,
+        error_train=None,             
+        default_objective_error=1e-3,
         include_meas_noise_in_band=True,  
         save_path=None,):
             """
-            Plot GP predictions over a candidate list, plus UCB on twin axis. Includes measurement RMS.
+            Plot GP predictions over a candidate list, plus UCB on twin axis. Includes measurement error.
             """
             # print("first train row:", self.experiment.input_repository[0])
             if save_path==None:
@@ -2117,15 +2295,15 @@ class MOBOPlotter:
             sigma = np.vstack(std_list)
 
             # Measurement noise level to add to the band
-            # We can use median RMS per objective from training data if provided
-            meas_sigma = np.full(n_obj, float(default_objective_rms))
-            if RMS_train is not None:
-                RMS_train = np.asarray(RMS_train, float)
+            # We can use median error per objective from training data if provided
+            meas_sigma = np.full(n_obj, float(default_objective_error))
+            if error_train is not None:
+                error_train = np.asarray(error_train, float)
                 if output_scaler is not None:
-                    # if RMS was stored in scaled space, convert to physical
-                    meas_sigma = np.median(RMS_train, axis=0) * output_scaler.scale_[:n_obj]
+                    # if error was stored in scaled space, convert to physical
+                    meas_sigma = np.median(error_train, axis=0) * output_scaler.scale_[:n_obj]
                 else:
-                    meas_sigma = np.median(RMS_train, axis=0)
+                    meas_sigma = np.median(error_train, axis=0)
 
             # Plot
             fig, ax1 = plt.subplots(figsize=(16, 12))
@@ -2146,7 +2324,7 @@ class MOBOPlotter:
 
                 y_mean = mu[j] * Weights[j]
 
-                # band std: GP std + measurement RMS
+                # band std: GP std + measurement error
                 if include_meas_noise_in_band:
                     std_plot = np.sqrt(sigma[j]**2 + meas_sigma[j]**2)
                 else:
@@ -2178,16 +2356,16 @@ class MOBOPlotter:
                 infeasible = ~feasible
 
                 for j in range(n_obj):
-                    # physical units for scatter + RMS
+                    # physical units for scatter + error
                     if output_scaler is not None:
                         y_phys = Y_train[:, j] * output_scaler.scale_[j] + output_scaler.mean_[j]
-                        if RMS_train is not None:
-                            rms_phys = np.asarray(RMS_train)[:, j] * output_scaler.scale_[j]
+                        if error_train is not None:
+                            error_phys = np.asarray(error_train)[:, j] * output_scaler.scale_[j]
                         else:
-                            rms_phys = np.full_like(y_phys, default_objective_rms, dtype=float)
+                            error_phys = np.full_like(y_phys, default_objective_error, dtype=float)
                     else:
                         y_phys = Y_train[:, j]
-                        rms_phys = np.asarray(RMS_train)[:, j] if RMS_train is not None else np.full_like(y_phys, default_objective_rms)
+                        error_phys = np.asarray(error_train)[:, j] if error_train is not None else np.full_like(y_phys, default_objective_error)
 
                     c = colours[j % len(colours)]
 
@@ -2196,14 +2374,14 @@ class MOBOPlotter:
                         ax1.errorbar(
                             pool_idx[infeasible],
                             (y_phys * Weights[j])[infeasible],
-                            yerr=(rms_phys * Weights[j])[infeasible],
+                            yerr=(error_phys * Weights[j])[infeasible],
                             fmt="o",
                             color="0.55",
                             ecolor="0.55",
                             capsize=3,
                             markersize=5,
                             alpha=0.85,
-                            label="measured infeasible ±RMS" if j == 0 else None,
+                            label="measured infeasible ±error" if j == 0 else None,
                         )
 
                     # feasible points in objective colour
@@ -2211,14 +2389,14 @@ class MOBOPlotter:
                         ax1.errorbar(
                             pool_idx[feasible],
                             (y_phys * Weights[j])[feasible],
-                            yerr=(rms_phys * Weights[j])[feasible],
+                            yerr=(error_phys * Weights[j])[feasible],
                             fmt="o",
                             color=c,
                             ecolor=c,
                             capsize=3,
                             markersize=5,
                             alpha=0.9,
-                            label="measured feasible ±RMS" if j == 0 else None,
+                            label="measured feasible ±error" if j == 0 else None,
                         )
 
             ax1.legend(loc="upper left")
@@ -2228,25 +2406,71 @@ class MOBOPlotter:
                 plt.savefig(save_path, dpi=150)
                 plt.savefig(save, dpi=150)
                 plt.close(fig)
-            else:
-                plt.show()
+            # else:
+            #     plt.show()
 
             return
 
-    def plot_pareto_front_colored(self, X, Y, pareto_idx, iteration, i, save_name):
+    def plot_pareto_front_colored(self, X, Y, pareto_idx, iteration, i, save_name, error_Y=None):
         """
         Plot evaluated points colored by third objective, and highlight Pareto front
         """
+        # X=X.to_numpy(dtype=float)
+        # Y=Y.to_numpy(dtype=float)
         if Y.shape[1]!=3:
             return
+        if error_Y is not None:
+            error_Y = np.asarray(error_Y, dtype=float)
         # Create a color array based on evaluation order
         order_colors = np.arange(len(Y))
 
         plt.figure(figsize=(8,6))
-        sc = plt.scatter(Y[:, 0], Y[:, 1], c=Y[:, 2],  cmap="viridis", s=20, edgecolor="None", alpha=0.8, label="Sampled Points")
 
-        # Highlight Pareto front
-        plt.scatter(Y[pareto_idx, 0], Y[pareto_idx, 1], c="None", s=20, edgecolor="k", label="Pareto Front")
+        if error_Y is not None and error_Y.shape == Y.shape:
+            plt.errorbar(
+                Y[:, 0], Y[:, 1],
+                xerr=error_Y[:, 0],
+                yerr=error_Y[:, 1],
+                fmt="none",
+                ecolor="0.6",
+                elinewidth=0.8,
+                alpha=0.35,
+                capsize=2,
+                zorder=1,
+            )
+
+        sc = plt.scatter(
+            Y[:, 0], Y[:, 1],
+            c=Y[:, 2],
+            cmap="viridis",
+            s=20,
+            edgecolor="None",
+            alpha=0.8,
+            label="Sampled Points",
+            zorder=2,
+        )
+
+        if error_Y is not None and error_Y.shape == Y.shape and len(pareto_idx) > 0:
+            plt.errorbar(
+                Y[pareto_idx, 0], Y[pareto_idx, 1],
+                xerr=error_Y[pareto_idx, 0],
+                yerr=error_Y[pareto_idx, 1],
+                fmt="none",
+                ecolor="k",
+                elinewidth=1.0,
+                alpha=0.6,
+                capsize=2,
+                zorder=3,
+            )
+
+        plt.scatter(
+            Y[pareto_idx, 0], Y[pareto_idx, 1],
+            c="None",
+            s=20,
+            edgecolor="k",
+            label="Pareto Front",
+            zorder=4,
+        )
 
         plt.xlabel("Objective 1")
         plt.ylabel("Objective 2")
@@ -2255,7 +2479,7 @@ class MOBOPlotter:
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"_{save_name}_current_sampled_points.png"))
+        plt.savefig(str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"_{save_name}_final_sampled_points.png"))
 
 
 
@@ -2265,7 +2489,7 @@ class MOBOPlotter:
     input_bounds,
     X_train,
     Y_train,
-    RMS_train=None,
+    error_train=None,
     CV_train=None,
     labels=None,
     iteration=None,
@@ -2276,7 +2500,7 @@ class MOBOPlotter:
     n_grid=300,
     two_sigma=2.0,
     slice_tol_frac=0.10,
-    default_objective_rms=1e-3,
+    default_objective_error=1e-3,
     feasible_tol=0.0,
     save_path=None,
             ):
@@ -2284,10 +2508,11 @@ class MOBOPlotter:
         Grid of 1D GP slices for each input dimension k.
         - All training points are shown in every slice (projected onto x_k).
         - Infeasible points are greyed out.
-        - Points near the slice (in other dims) get RMS error bars.
+        - Points near the slice (in other dims) get error error bars.
         """
         import math
         print('Plotting sliced GPs')
+        print(error_train)
         if save_path==None:
             save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_sliced_iter_{iteration}.png")
             save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_sliced.png")
@@ -2308,13 +2533,13 @@ class MOBOPlotter:
 
         infeasible = ~feasible
 
-        # RMS
-        if RMS_train is None:
-            RMS_train = np.full((n_train, n_obj), float(default_objective_rms), dtype=float)
+        # error
+        if error_train is None:
+            error_train = np.full((n_train, n_obj), float(default_objective_error), dtype=float)
         else:
-            RMS_train = np.asarray(RMS_train, float)
-            if RMS_train.shape != (n_train, n_obj):
-                raise ValueError(f"RMS_train must be shape {(n_train, n_obj)}, got {RMS_train.shape}")
+            error_train = np.asarray(error_train, float)
+            if error_train.shape != (n_train, n_obj):
+                raise ValueError(f"error_train must be shape {(n_train, n_obj)}, got {error_train.shape}")
 
         # choose x0
         if x0 is None:
@@ -2364,10 +2589,10 @@ class MOBOPlotter:
             for j in range(n_obj):
                 if output_scaler is not None:
                     y = Y_train[:, j] * output_scaler.scale_[j] + output_scaler.mean_[j]
-                    rms = RMS_train[:, j] * output_scaler.scale_[j]
+                    error = error_train[:, j] * output_scaler.scale_[j]
                 else:
                     y = Y_train[:, j]
-                    rms = RMS_train[:, j]
+                    error = error_train[:, j]
 
                 # infeasible (greyed out)
                 if np.any(infeasible):
@@ -2395,19 +2620,19 @@ class MOBOPlotter:
                     m = near & infeasible
                     if np.any(m):
                         ax.errorbar(
-                            X_train[m, k], y[m], yerr=rms[m],
+                            X_train[m, k], y[m], yerr=error[m],
                             fmt="o", markersize=4.5, capsize=2.5, elinewidth=1.0,
                             color="0.45", ecolor="0.45", alpha=0.9,
-                            label="near slice ±RMS (infeas)" if (k == 0 and j == 0) else None,
+                            label="near slice ±error (infeas)" if (k == 0 and j == 0) else None,
                         )
                     # near & feasible
                     m = near & feasible
                     if np.any(m):
                         ax.errorbar(
-                            X_train[m, k], y[m], yerr=rms[m],
+                            X_train[m, k], y[m], yerr=error[m],
                             fmt="o", markersize=4.5, capsize=2.5, elinewidth=1.0,
                             alpha=0.95,
-                            label="near slice ±RMS (feas)" if (k == 0 and j == 0) else None,
+                            label="near slice ±error (feas)" if (k == 0 and j == 0) else None,
                         )
 
             # GP mean/band for each objective

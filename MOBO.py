@@ -28,7 +28,7 @@ Config.warnings['not_compiled'] = False
 warnings.filterwarnings("ignore", category=UserWarning)
 np.seterr(invalid='ignore')
 
-DERIVED_OBJECTIVES = {"4D_BRIGHTNESS"}
+from shutil import copy2
 
 
 class InteractiveEvaluator:
@@ -53,14 +53,14 @@ class InteractiveEvaluator:
         input("\nPress ENTER once measurement is complete...")
 
         Y_obj = []
-        Y_rms = []
+        Y_error = []
 
         print("\nEnter objective values:")
         for obj in self.objectives:
             v = self._ask_float(f"  {obj['name']} value: ")
-            r = self._ask_float(f"  {obj['name']} RMS  : ")
+            r = self._ask_float(f"  {obj['name']} error  : ")
             Y_obj.append(v)
-            Y_rms.append(r)
+            Y_error.append(r)
 
         Y_con = []
         if self.constraints:
@@ -70,15 +70,15 @@ class InteractiveEvaluator:
                 Y_con.append(v)
 
         Y_all = np.array(Y_obj + Y_con, dtype=float)
-        return Y_all, np.array(Y_rms, dtype=float).reshape(1, -1)
+        return Y_all, np.array(Y_error, dtype=float).reshape(1, -1)
 
     def evaluate_batch(self, X):
-        Ys, Yrms = [], []
+        Ys, Yerror = [], []
         for x in X:
             y, r = self.evaluate(x.reshape(1, -1))
             Ys.append(y)
-            Yrms.append(r[0])
-        return np.array(Ys, dtype=float), np.array(Yrms, dtype=float)
+            Yerror.append(r[0])
+        return np.array(Ys, dtype=float), np.array(Yerror, dtype=float)
 
 
 @dataclass
@@ -93,6 +93,8 @@ class MOBOConfig:
     objective_directions: list = None
     output_indices: list = None
     reference_point: list = None
+    constraints: list = None
+    penalties: list = None
 
     #initial samples
     initial_samples: list = None
@@ -117,15 +119,18 @@ class MOBOConfig:
 
     # Optimisation controls
     resume: bool = False
-    restart_from_iteration: int | None = None
+    restart_from_iteration: int = None
+
+    multiprocess_bool: bool = False
 
     # Noise handling
-    use_real_rms: bool = False
-    default_objective_rms: float = 1e-10
+    use_real_error: bool = False
+    default_objective_error: float = 1e-10
 
     # Goal-function evaluator options
     goal_function_path: str = ""
     goal_function_name: str = "goal_function"
+    goal_function_kwargs: dict = None
 
     # Model / training data paths (previously hardcoded)
     model_path: str = ""
@@ -157,20 +162,23 @@ def parse_initial_samples(parser):
         if not val.strip():
             continue
 
-        # inputs | objectives | rms | constraints
+        # inputs | objectives | error | constraints | penalties
         parts = [p.strip() for p in val.split("|")]
 
         x = [float(v) for v in parts[0].split(",")]
         y = [float(v) for v in parts[1].split(",")]
 
-        rms = [float(v) for v in parts[2].split(",")] if len(parts) > 2 else None
+        error = [float(v) for v in parts[2].split(",")] if len(parts) > 2 else None
         con = [float(v) for v in parts[3].split(",")] if len(parts) > 3 else None
+
+        pen = [float(v) for v in parts[4].split(",")] if len(parts) > 4 else None
 
         samples.append({
             "X": x,
             "Y": y,
-            "RMS": rms,
-            "C": con
+            "error": error,
+            "C": con,
+            "P": pen,
         })
 
     return samples
@@ -260,6 +268,14 @@ def load_txt_config(path):
                 "threshold": float(thresh),
                 "scale": (float(scale) if scale is not None and str(scale).strip() != "" else None),
             })
+
+    if "PENALTIES" in parser:
+        penalties = []
+        for name, value in parser["PENALTIES"].items():
+            parts = [v.strip() for v in value.split(",")]
+            name, lower, upper, scale, rate = parts
+            penalties.append({"name": name.strip(), "lower": lower, "upper": upper, "scale": scale, "rate": rate})
+
     
     # initial samples
     initial_samples = parse_initial_samples(parser)
@@ -278,8 +294,19 @@ def load_txt_config(path):
         goal_function_path = Path(os.getcwd()).resolve()
     else:
         goal_function_path = Path(str(goal_function_path)).expanduser().resolve()
+    goal_function_kwargs_raw = get_general("goal_function_kwargs", None)
+    if goal_function_kwargs_raw is None or str(goal_function_kwargs_raw).strip() == "":
+        goal_function_kwargs = {}
+    else:
+        try:
+            goal_function_kwargs = json.loads(goal_function_kwargs_raw)
+        except Exception:
+            warnings.warn("goal_function_kwargs could not be parsed as JSON; using empty dict.")
+            goal_function_kwargs = {}
 
     working_dir_cfg = get_general("working_dir", None)
+
+    multiprocess_bool = as_bool(get_general("multiprocess_bool", False))
 
     # Standard subfolders under the working directory
     outputs_dirname = "Outputs"
@@ -309,17 +336,21 @@ def load_txt_config(path):
         save_name=str(get_general("save_name", "mobo_run")),
         input_bounds=input_bounds,
         inputs=inputs,
+        constraints=constraints,
+        penalties=penalties,
         input_columns=input_columns,
         resume=bool(resume),
         restart_from_iteration=restart_from_iteration,
+        multiprocess_bool=multiprocess_bool,
         reference_point=reference_point,
-        use_real_rms=as_bool(get_general("use_real_rms", False)),
-        default_objective_rms=as_float(get_general("default_objective_rms", 1e-10)),
+        use_real_error=as_bool(get_general("use_real_error", False)),
+        default_objective_error=as_float(get_general("default_objective_error", 1e-10)),
         objectives=objective_names,
         objective_directions=objective_directions,
         initial_samples=initial_samples,
         goal_function_path=str(get_general("goal_function_path", "")),
         goal_function_name=str(get_general("goal_function_name", "goal_function")),
+        goal_function_kwargs=goal_function_kwargs,
         model_path=str(get_general("model_path", "")),
         training_csv_path=str(get_general("training_csv_path", "")),
         feasible_tol=as_float(get_general("feasible_tol", 0.0)),
@@ -334,7 +365,7 @@ def load_txt_config(path):
         benchmarks_dirname=str(benchmarks_dirname),
     )
 
-    return cfg, inputs, objectives, constraints
+    return cfg, inputs, objectives, constraints, penalties
 
 
 def build_mobo_config(
@@ -342,6 +373,7 @@ def build_mobo_config(
     inputs,
     objectives,
     constraints=None,
+    penalties=None,
     input_columns=[],
     initial_samples=None,
 
@@ -356,11 +388,14 @@ def build_mobo_config(
     resume=False,
     restart_from_iteration=None,
 
-    use_real_rms=False,
-    default_objective_rms=1e-10,
+    multiprocess_bool = False,
+
+    use_real_error=False,
+    default_objective_error=1e-10,
 
     goal_function_path="",
     goal_function_name="goal_function",
+    goal_function_kwargs= None,
 
     model_path="",
     training_csv_path="",
@@ -376,6 +411,7 @@ def build_mobo_config(
     Build MOBOConfig + validated inputs/objectives/constraints from Python arguments
     """
     constraints = constraints or []
+    penalties = penalties or []
 
     # INPUTS
     input_bounds = [(inp["min"], inp["max"]) for inp in inputs]
@@ -399,6 +435,34 @@ def build_mobo_config(
     (wd / outputs_dirname).mkdir(parents=True, exist_ok=True)
     (wd / benchmarks_dirname).mkdir(parents=True, exist_ok=True)
 
+    if weight is not None and len(weight) != len(objective_names):
+        warnings.warn(
+            f"weight has length {len(weight)} but there are {len(objective_names)} objectives. "
+            f"Weighting may fail if enabled."
+        )
+
+    for s in initial_samples or []:
+        if len(s["X"]) != len(inputs):
+            warnings.warn(
+                f"Initial sample X has length {len(s['X'])}, expected {len(inputs)}."
+            )
+        if len(s["Y"]) != len(objective_names):
+            warnings.warn(
+                f"Initial sample Y has length {len(s['Y'])}, expected {len(objective_names)}."
+            )
+        if s.get("error") is not None and len(s["error"]) != len(objective_names):
+            warnings.warn(
+                f"Initial sample error has length {len(s['error'])}, expected {len(objective_names)}."
+            )
+        if s.get("C") is not None and len(s["C"]) != len(constraints):
+            warnings.warn(
+                f"Initial sample C has length {len(s['C'])}, expected {len(constraints)}."
+            )
+        if s.get("P") is not None and len(s["P"]) != len(penalties):
+            warnings.warn(
+                f"Initial sample P has length {len(s['P'])}, expected {len(penalties)}."
+            )
+
     cfg = MOBOConfig(
         evaluation_method=str(evaluation_method),
         weighting=bool(weighting),
@@ -410,16 +474,20 @@ def build_mobo_config(
         input_bounds=input_bounds,
         inputs=inputs,
         input_columns=input_columns,
+        constraints=constraints,
+        penalties=penalties,
         resume=bool(resume),
         restart_from_iteration=restart_from_iteration,
+        multiprocess_bool=multiprocess_bool,
         reference_point=reference_point,
-        use_real_rms=bool(use_real_rms),
-        default_objective_rms=float(default_objective_rms),
+        use_real_error=bool(use_real_error),
+        default_objective_error=float(default_objective_error),
         objectives=objective_names,
         objective_directions=objective_directions,
         initial_samples=initial_samples,
         goal_function_path=str(goal_function_path),
         goal_function_name=str(goal_function_name),
+        goal_function_kwargs=goal_function_kwargs,
         model_path=str(model_path),
         training_csv_path=str(training_csv_path),
         feasible_tol=float(feasible_tol),
@@ -434,15 +502,16 @@ def build_mobo_config(
         benchmarks_dirname=str(benchmarks_dirname),
     )
 
-    return cfg, inputs, objectives, constraints
+    return cfg, inputs, objectives, constraints, penalties
 
 
 class MOBOExperiment:
-    def __init__(self, config: MOBOConfig, inputs, objectives, constraints, plotter: MOBOPlotter = None):
+    def __init__(self, config: MOBOConfig, inputs, objectives, constraints, penalties, plotter: MOBOPlotter = None):
         self.config = config
         self.inputs = inputs
         self.objectives = objectives
         self.constraints = constraints
+        self.penalties = penalties
         self.inputs_spec = inputs
         self.input_columns = self.config.input_columns
         self.objectives_spec = objectives
@@ -451,6 +520,10 @@ class MOBOExperiment:
         self.plotter = plotter or MOBOPlotter()
         self.timestamp = datetime.now().strftime("%Y%m%d")
         self.save_prefix = f"{self.timestamp}_{self.config.save_name}"
+        self.multiprocess_bool=self.config.multiprocess_bool
+
+        self.objective_names = [o["name"] for o in self.objectives]
+        self.constraint_names = [o["name"] for o in self.constraints]
 
         self.evaluator = EvaluatorFactory.create(
             self.config.evaluation_method,
@@ -458,15 +531,23 @@ class MOBOExperiment:
             inputs=self.inputs,
             objectives=self.objectives,
             constraints=self.constraints,
+            penalties=self.penalties,
             goal_function_path=self.config.goal_function_path,
             goal_function_name=self.config.goal_function_name,
-            default_objective_rms=self.config.default_objective_rms,
+            goal_function_kwargs=config.goal_function_kwargs,
+            default_objective_error=self.config.default_objective_error,
         )
 
         self.input_repository = None
         self.output_repository = None
+        self.constraint_value_repository = None
+        self.constraint_violation_repository = None
         self.constraint_repository = None
-        self.rms_repository = None
+        n_pen = len(self.penalties or [])
+        self.penalty_raw_repository = np.empty((0, n_pen), dtype=float)
+        self.penalty_value_repository = np.empty((0, n_pen), dtype=float)
+        self.penalty_total_repository = np.empty((0,), dtype=float)
+        self.error_repository = None
 
         # Extra repositories for full post-analysis
         self.raw_repository = None
@@ -496,6 +577,8 @@ class MOBOExperiment:
             random_seed=np.random.randint(0, 1e6)
         )
 
+        
+
         result = setup.run(no_of_init_samples=self.config.no_of_meas)
 
         # Attach results to optimisation
@@ -513,19 +596,16 @@ class MOBOExperiment:
         self.setup()
 
         optimiser = BatchOptimiser(self)
-        results = optimiser.run(resume=self.config.resume)
-        self.save_results(results)
+        results = optimiser.run(resume=self.config.resume)    
 
-        pf = np.asarray(results["pareto_front"])
-        pf_inputs = np.asarray(results["pareto_front_inputs"])
-        hv = results["hypervolume"]
-        gd = results["generational_distance"]
-        div = results["diversity"]
-        spacing = results["spacing"]
-        num_pf = results["num_pf_points"]
-        runtime = results["timed_iterations"]
-        X = results["X_repo"]
-        Y = results["Y_repo"]
+        repo, pf_repo, metrics_repo = self.save_results(results)
+        metrics_repo = pd.DataFrame(results["metrics_repo"])
+
+        pf = pf_repo[self.objective_names]
+
+        pf_inputs = pf_repo[self.input_columns]
+        X = repo[self.input_columns]
+        Y = repo[self.objective_names]
 
         # Plotting / summary
         outdir = Path(self.config.working_dir) / self.config.outputs_dirname
@@ -534,7 +614,7 @@ class MOBOExperiment:
         experiment_dir.mkdir(exist_ok=True)
 
         self.plotter.plot_hypervolume_evolution(
-            hv, self.config.evaluation_method, experiment_dir, self.config.iterations, self.config.save_name
+            metrics_repo['Hypervolume'], self.config.evaluation_method, experiment_dir, self.config.iterations, self.config.save_name
         )
 
         pf, pf_idx = compute_pareto_front_constrained(Y, self.constraint_repository)
@@ -545,65 +625,132 @@ class MOBOExperiment:
             self.config.evaluation_method, experiment_dir, self.config.save_name
         )
 
-        self.plotter.plot_pareto_front_colored(
-            X, Y, pf_idx, self.config.iterations, self.config.iterations, self.config.save_name
-        )
+        error_cols = [f"error_{name}" for name in self.objective_names]
+        error_Y = repo[error_cols].to_numpy(dtype=float)
+        Y = repo[self.objective_names].to_numpy(dtype=float)
+        X = repo[self.input_columns].to_numpy(dtype=float)
 
-        self.plotter.plot_metrics_evolution(
-            hypervolume=hv,
-            spacing=spacing,
-            generational_distance=gd,
-            diversity=div,
-            num_pf_points=num_pf,
-            runtime=runtime,
-            save_prefix=experiment_dir
-        )
 
-        return results
+        self.plotter.plot_pareto_front_colored(X, Y, pf_idx, self.config.iterations, self.config.iterations,
+            self.config.save_name,error_Y=error_Y)
+
+        # self.plotter.plot_metrics_evolution(
+        #     hypervolume=metrics_repo['Hypervolume'],
+        #     spacing=metrics_repo['Spacing'],
+        #     generational_distance=metrics_repo['Generational_Distance'],
+        #     diversity=metrics_repo['Diversity'],
+        #     num_pf_points=metrics_repo['PF Count'],
+        #     runtime=metrics_repo['Runtime'],
+        #     save_prefix=experiment_dir
+        # )
+
+        # self.plotter.plot_gp_models_over_discrete_grid(
+        #     gp_models=optimiser.gp_models,
+        #     input_specs=self.inputs_spec,
+        #     X_train=optimiser.input_repository,
+        #     Y_train=optimiser.output_repository,
+        #     error_train=getattr(optimiser, "error_repository", None),
+        #     CV_train=getattr(optimiser, "constraint_repository", None),
+        #     labels=self.objective_names,
+        #     iteration=self.config.iterations,
+        #     input_scaler=getattr(optimiser, "input_scaler", None),
+        #     output_scaler=getattr(optimiser, "output_scaler", None),
+        #     feasible_tol=self.config.feasible_tol,
+        #     default_objective_error=self.config.default_objective_error,
+        #     save_path=Path(self.config.outputs_dirname+'/gp_models_final.png'),
+        #     show=False,
+        # )
+
+        return repo, pf_repo, metrics_repo
 
     def save_results(self, results: dict):
         outdir = Path(getattr(self.config, "working_dir", ".")) / str(getattr(self.config, "outputs_dirname", "Outputs"))
         outdir.mkdir(exist_ok=True)
         experiment_dir = outdir / self.save_prefix
         experiment_dir.mkdir(exist_ok=True)
-        prefix = experiment_dir / f"{self.config.save_name}_{self.config.evaluation_method}"
+        prefix = experiment_dir #/ f"{self.config.save_name}_{self.config.evaluation_method}"
 
         # Save PF
-        np.savetxt(f"{prefix}_pareto_front.csv", results["pareto_front"], delimiter=",")
+        # np.savetxt(f"{prefix}_pareto_front.csv", results["pareto_front"], delimiter=",")
+        
+        df=pd.DataFrame(results['raw_repo'])
+        labels=['iteration']
+        inputs, objs, error_specs, con_val, con_viol= [],[],[],[],[]
+        objective_names = [o["name"] for o in self.objectives]
+        constraint_names = [o["name"] for o in self.constraints]
+        for i in range(len(self.input_columns)):
+            labels.append(self.input_columns[i])
+        for i in range(len(objective_names)):
+            labels.append(objective_names[i])
+        for i in range(len(objective_names)):
+            labels.append('error_'+objective_names[i])
+        for i in range(len(constraint_names)):
+            labels.append('value_'+constraint_names[i])
+        for i in range(len(constraint_names)):
+            labels.append('processed_value_'+constraint_names[i])
+        labels.append('constraint_value_used')
+        penalty_names = [p["name"] for p in self.penalties]
+        for name in penalty_names:
+            labels.append(f"raw_penalty_{name}")
+        for name in penalty_names:
+            labels.append(f"processed_penalty_{name}")
+        labels.append("total_penalty")
+        df.columns=labels
+        print(df)
+        df.to_csv(f"{prefix}/_raw_repository.csv", header=True)
 
-        # Save metrics dynamically
-        for key, arr in results.items():
-            if key in ["pareto_front", "X_repo", "Y_repo"]:
-                continue
-            arr = np.asarray(arr, dtype=float)
-            np.savetxt(f"{prefix}_{key}.csv", arr, delimiter=",")
+        print(results['metrics_repo'])
 
-        # Save repositories
-        np.savetxt(f"{prefix}_initial_pf.csv", self.init_pareto_front, delimiter=",")
-        np.savetxt(f"{prefix}_input_samples.csv", results["X_repo"], delimiter=",")
-        np.savetxt(f"{prefix}_samples.csv", results["Y_repo"], delimiter=",")
+        metrics_repo = pd.DataFrame(results['metrics_repo'])
+
+        preferred_cols = [
+            'Iteration',
+            'Hypervolume',
+            'Generational_Distance',
+            'Diversity',
+            'Spacing',
+            'PF Count',
+            'Runtime',
+            'Goal_func_kwargs',
+        ]
+
+        ordered_cols = [c for c in preferred_cols if c in metrics_repo.columns]
+        remaining_cols = [c for c in metrics_repo.columns if c not in ordered_cols]
+        metrics_repo = metrics_repo[ordered_cols + remaining_cols]
+
+        metrics_repo.to_csv(f"{prefix}/_metrics_repository.csv", header=True)
+
         self.save_metadata(prefix)
         self.logger.info(f"Saved results and metadata to {prefix.parent}")
 
         # Save GP Models
-        gp_save_path = f"{prefix}_gp_models.pkl"
+        gp_save_path = f"{prefix}/_gp_models.pkl"
         with open(gp_save_path, "wb") as f:
-            pickle.dump(self.gp_models, f)
+            pickle.dump({"objective_gps": self.gp_models,
+                        "cv_gp": getattr(self, "cv_gp_model", None)}, f)
+            
+        config_path = f"{prefix}/_run_config.json"
+        with open(config_path, "w") as f:
+            json.dump(asdict(self.config), f, indent=2, default=str)
+            
+        goal_src = Path(self.config.goal_function_path)
+        if goal_src.exists() and goal_src.is_file():
+            goal_dst = Path(f"{prefix}/_goal_function_source.py")
+            copy2(goal_src, goal_dst)
 
-        # Save Pareto Front Input Coordinates
-        if "pareto_front_inputs" in results:
-            pf_inputs = np.asarray(results["pareto_front_inputs"])
-        if "pareto_front_rms" in results:
-            pf_rms = np.asarray(results["pareto_front_rms"])
-        else:
-            CV_repo = np.asarray(results["CV_repo"], dtype=float)
-            pf, pf_idx = compute_pareto_front_constrained(results["Y_repo"], CV_repo)
-            pf_inputs = np.asarray(results["X_repo"])[pf_idx]
-            pf_rms = np.asarray(results["rms_repo"])[pf_idx]
+        Y=[]
+        for i in range(len(objective_names)):
+            Y.append(df[objective_names[i]].values)
+        Y=np.asarray(Y).T
+        CV=(df['constraint_value_used'].values)
 
-        np.savetxt(f"{prefix}_pareto_inputs.csv", pf_inputs, delimiter=",")
-        np.savetxt(f"{prefix}_pareto_rms.csv", pf_rms, delimiter=",")
+        pf, pf_idx = compute_pareto_front_constrained(Y, CV)
+        raw_pf = df[df.index.isin(pf_idx)]
+
+        raw_pf.to_csv(f"{prefix}/_raw_repository_pareto.csv", header=True)
         self.logger.info(f"Saved results and metadata to {prefix.parent}")
+
+        return df, raw_pf, metrics_repo
 
     def save_metadata(self, prefix):
         outdir = Path(getattr(self.config, "working_dir", ".")) / str(getattr(self.config, "outputs_dirname", "Outputs"))
@@ -618,8 +765,11 @@ class MOBOExperiment:
         metadata["objectives_spec"] = self.objectives_spec
         metadata["constraints_spec"] = self.constraints_spec
         metadata["inputs_spec"] = self.inputs_spec
+        metadata["goal_function_kwargs_used"] = self.config.goal_function_kwargs
+        metadata["goal_function_path_used"] = str(self.config.goal_function_path)
+        metadata["goal_function_name_used"] = str(self.config.goal_function_name)
 
-        meta_path = f"{prefix}_metadata.json"
+        meta_path = f"{prefix}/_metadata.json"
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2, default=str)
 
@@ -643,7 +793,7 @@ def load_checkpoint(filename):
     return None
 
 
-def benchmark_single_config(cfg, inputs, objectives, constraints, n_runs=1, output_dir="", checkpoint_file=""):
+def benchmark_single_config(cfg, inputs, objectives, constraints, penalties, n_runs=1, output_dir="", checkpoint_file=""):
     """
     Run the optimiser multiple times (with random seeds) and save results
     """
@@ -679,13 +829,13 @@ def benchmark_single_config(cfg, inputs, objectives, constraints, n_runs=1, outp
         print(f"\n[Benchmark] Run {seed + 1}/{n_runs}")
         np.random.seed(seed)
 
-        exp = MOBOExperiment(cfg, inputs, objectives, constraints)
+        exp = MOBOExperiment(cfg, inputs, objectives, constraints, penalties)
+        print("INPUT SPECS:", [c["name"] for c in exp.inputs_spec])
         print("OBJ SPECS:", [o["name"] for o in exp.objectives_spec])
         print("CON SPECS:", [c["name"] for c in exp.constraints_spec])
+        print("PEN SPECS:", [c["name"] for c in exp.penalties])
 
-        _ = exp.run()
-
-        best_pf = exp.best_pareto_front
+        repo, pf_repo, metrics_repo = exp.run()
 
         progress["completed_runs"] += 1
         save_checkpoint(progress, checkpoint_file)
@@ -694,8 +844,12 @@ def benchmark_single_config(cfg, inputs, objectives, constraints, n_runs=1, outp
     cfg.save_name = base_save_name
 
 
+
+    return repo, pf_repo, metrics_repo
+
+
 def get_run_dir(base_output_dir, timestamp, save_name, run_id):
-    return os.path.join(base_output_dir, f"{timestamp}_{save_name}_run{run_id}")
+    return base_output_dir#os.path.join(base_output_dir, f"{timestamp}_{save_name}_run{run_id}")
 
 
 def summarize_results(cfg, n_runs, timestamp, output_dir="", best_pf=None):
@@ -703,13 +857,13 @@ def summarize_results(cfg, n_runs, timestamp, output_dir="", best_pf=None):
     save_name = cfg.save_name
     metrics = ["hypervolume", "generational_distance", "spacing", "diversity", "num_pf_points"]
     output_dir = str(Path(getattr(cfg, "working_dir", ".")) / str(getattr(cfg, "outputs_dirname", "Outputs")))
-    summary_dir = os.path.join(output_dir, f"Summary_{timestamp}_{cfg.save_name}")
+    summary_dir = os.path.join(output_dir)#, f"Summary_{timestamp}_{cfg.save_name}")
     os.makedirs(output_dir, exist_ok=True)
 
     for metric in metrics:
         all_runs = []
         for seed in range(n_runs):
-            run_folder = f"{output_dir}/{timestamp}_{save_name}_run{seed}"
+            run_folder = f"{output_dir}#/{timestamp}_{save_name}_run{seed}"
             filename = f"{run_folder}/{save_name}_run{seed}_{cfg.evaluation_method}_{metric}.csv"
 
             if os.path.exists(filename):
@@ -733,6 +887,7 @@ def run_mobo(
     inputs,
     objectives,
     constraints=None,
+    penalties=None,
     initial_samples=None,
 
     evaluation_method="Manual",
@@ -746,11 +901,14 @@ def run_mobo(
     resume=False,
     restart_from_iteration=None,
 
-    use_real_rms=False,
-    default_objective_rms=1e-10,
+    multiprocess_bool=False,
+
+    use_real_error=False,
+    default_objective_error=1e-10,
 
     goal_function_path="",
     goal_function_name="goal_function",
+    goal_function_kwargs=None,
 
     model_path=None, 
     training_csv_path="",
@@ -767,10 +925,11 @@ def run_mobo(
     """
     Main importable function
     """
-    cfg, inputs, objectives, constraints = build_mobo_config(
+    cfg, inputs, objectives, constraints, penalties = build_mobo_config(
         inputs=inputs,
         objectives=objectives,
         constraints=constraints,
+        penalties=penalties,
         evaluation_method=evaluation_method,
         weighting=weighting,
         weight=weight,
@@ -780,10 +939,12 @@ def run_mobo(
         save_name=save_name,
         resume=resume,
         restart_from_iteration=restart_from_iteration,
-        use_real_rms=use_real_rms,
-        default_objective_rms=default_objective_rms,
+        multiprocess_bool=multiprocess_bool,
+        use_real_error=use_real_error,
+        default_objective_error=default_objective_error,
         goal_function_path=goal_function_path,
         goal_function_name=goal_function_name,
+        goal_function_kwargs=goal_function_kwargs,
         model_path=model_path,
         training_csv_path=training_csv_path,
         feasible_tol=feasible_tol,
@@ -801,23 +962,24 @@ def run_mobo(
 
     checkpoint_file = str(Path(cfg.working_dir) / cfg.benchmarks_dirname / f"{cfg.save_name}.pkl")
 
-    benchmark_single_config(
+    repo, pf_repo, metrics_repo = benchmark_single_config(
         cfg,
         inputs,
         objectives,
         constraints,
+        penalties,
         n_runs=n_runs,
         checkpoint_file=checkpoint_file,
     )
 
-    return cfg
+    return repo, pf_repo, metrics_repo
 
 
 def run_mobo_from_config(config_path, n_runs=1):
     """
     Backward-compatible file-based entrypoint.
     """
-    cfg, inputs, objectives, constraints = load_txt_config(config_path)
+    cfg, inputs, objectives, constraints, penalties = load_txt_config(config_path)
 
     if getattr(cfg, "working_dir", None):
         os.makedirs(cfg.working_dir, exist_ok=True)
@@ -827,16 +989,17 @@ def run_mobo_from_config(config_path, n_runs=1):
 
     checkpoint_file = str(Path(cfg.working_dir) / cfg.benchmarks_dirname / f"{cfg.save_name}.pkl")
 
-    benchmark_single_config(
+    repo, pf_repo, metrics_repo = benchmark_single_config(
         cfg,
         inputs,
         objectives,
         constraints,
+        penalties,
         n_runs=n_runs,
         checkpoint_file=checkpoint_file,
     )
 
-    return cfg
+    return repo, pf_repo, metrics_repo
 
 
 

@@ -3,376 +3,707 @@ Multi-Objective Bayesian Optimisation (MOBO) – User Manual
 
 1. Overview
 -----------
-This package provides a multi-objective Bayesian optimisation (MOBO) workflow for accelerator tuning, beamline optimisation, and other physics problems where each evaluation is expensive and multiple competing performance metrics must be balanced under operational constraints.
+This package implements a constrained multi-objective Bayesian optimisation workflow for expensive optimisation tasks such as accelerator tuning and beamline studies.
 
-The code is designed for two common use cases:
+The code supports two main operating modes:
+- manual operation, where an operator applies each suggested setting and enters measured values
+- automated goal-function operation, where a Python function returns objectives, errors, constraints, and optionally penalties
 
-- Interactive/manual operation, where an operator applies suggested machine settings and enters measured values
-- Automated evaluation, where a Python goal function or simulation returns objective and constraint values directly
+The optimiser uses independent Gaussian Process models, a feasibility-first Pareto rule, and a batch UCB acquisition function with optional soft penalisation of predicted infeasible regions.
 
-2. Optimisation workflow
----------------------------
-Each optimisation run follows the same high-level cycle:
+2. End-to-end workflow
+----------------------
+Each run follows this high-level process:
 
-1. Define the search space through bounded input variables.
-2. Define one or more objectives, each marked as either a minimisation or maximisation target.
+1. Define bounded input variables.
+2. Define one or more objectives.
 3. Optionally define constraints.
-4. Initialise the dataset (from CSV or by generating initial samples).
-5. Evaluate the initial dataset either manually or through an automated function.
-6. Train one Gaussian Process (GP) surrogate model per objective.
-7. If constraints are present and enabled for penalisation, train an additional GP on the scalar constraint-violation measure.
-8. Use the acquisition function to propose the next point or batch of points.
-9. Evaluate the proposed settings and append them to the repository.
-10. Recompute the feasible Pareto front and optimisation metrics.
-11. Repeat until the requested number of iterations is complete.
-
-The current production acquisition path is based on BATCH_UCB
+4. Optionally define soft penalties on raw measured quantities.
+5. Build the initial dataset from a CSV, from explicit initial samples, or by online sampling.
+6. Convert maximisation objectives into internal minimisation form.
+7. Train one GP per objective.
+8. If enabled, train one extra GP on the scalar constraint violation.
+9. Generate a candidate pool in the bounded search space.
+10. Score candidates with the batch UCB acquisition function.
+11. Apply optional objective weighting and optional feasibility penalty.
+12. Choose one point or a batch of points using a greedy diversity penalty.
+13. Evaluate the selected point or points.
+14. Update the repositories, metrics, Pareto front, and saved artefacts.
+15. Repeat until the requested number of iterations is complete.
 
 3. Internal optimisation conventions
 ------------------------------------
-3.1 Objective directions
+3.1 Objective direction
 
-The optimiser internally treats all objectives as minimisation problems.
+The optimiser is written as a minimiser. Internally:
+- objectives declared as `min` are used directly
+- objectives declared as `max` are negated before modelling and acquisition
 
-- Objectives declared as min are used directly
-- Objectives declared as max are transformed internally by negating the physical value.
+This means saved physical objective values and internal optimisation values are not always numerically identical for maximisation objectives. Some objectives are best constructed as a minimisation problem from their value to a specific defined objective value (eg. if an objective should be minimised but could be positive or negative, it should be defined as a minimisation of its distance to 0).
 
-3.2 Feasible Pareto-front logic
+3.2 Feasible Pareto front
 
-The final Pareto front is always constructed using a feasibility-first rule.
+The final Pareto front is computed with a feasibility-first rule:
+- if at least one feasible point exists, only feasible points are eligible for the Pareto front
+- if no feasible point exists, the least-infeasible point or points are used instead
 
-- If at least one feasible point exists, only feasible points are considered when computing the Pareto front.
-- If no feasible points exist, the best available set is taken to be the point or points with the smallest total constraint violation.
+Feasibility for final front construction is based on:
 
-4. Constraint implementation
-----------------------------
-4.1 Constraint definitions
+    CV <= 1e-12
 
-Constraints are defined independently of the objectives and are specified using:
-- name
-- sense (<= or >=)
-- threshold
-- optionally a scale
+where `CV` is the scalar combined constraint violation.
 
-4.2 Per-constraint violation calculation
+4. Inputs, objectives, constraints, and penalties
+-------------------------------------------------
+4.1 Inputs
 
-Each constraint is converted into a non-negative violation quantity.
-
-For:
-- value <= threshold, violation = max(0, value - threshold)
-- value >= threshold, violation = max(0, threshold - value)
-
-4.3 Combined constraint violation (CV)
-
-When multiple constraints are present, the code combines them into a single scalar constraint violation value:
-
-    CV = max(per_constraint_violations)
-
-This means the worst violated constraint dominates the scalar infeasibility measure.
-
-5. Acquisition function and search behaviour
-----------------------------------------------
-5.1 Active acquisition method
-
-The currently active acquisition strategy is BATCH_UCB.
-
-At each iteration the optimiser:
-1. Generates a candidate pool in the bounded input space.
-2. Predicts the mean and uncertainty of each objective at every candidate.
-3. Combines the objective predictions into a scalar acquisition value.
-4. Selects the candidate with the lowest acquisition value.
-5. If batch mode is active, it applies a diversity penalty around the selected point and greedily selects the remaining batch points
-
-5.2 Candidate generation
-
-Candidate points are generated using a Sobol sequence and then scaled to the user’s input bounds.
-
-Previously sampled points are removed from the candidate pool (within a small tolerance).
-
-Important note:
-The input specification includes a step field, but the active BATCH_UCB path samples candidates continuously within the bounds rather than enforcing a strict discrete grid. This is to reduce the time required for candidate selection in high-dimensional spacse.
-
-5.3 UCB acquisition in minimisation form
-
-For each objective GP and each candidate point, the optimiser evaluates:
-- predictive mean
-- predictive standard deviation
-
-These are combined as:
-
-    acq_raw(x) = Σ_j [ mu_j(x) - beta * sigma_j(x) ]
-
-Lower values are preferred.
-
-6. Penalty mechanisms
---------------------
-6.1 Active penalty model
-
-The primary active penalty mechanism is a GP-based acquisition penalty on predicted constraint violation.
-
-When constraints are defined and constraint_penalty_alpha > 0, an additional GP is fit to the scalar CV repository.
-
-For each candidate point:
-
-    penalty_factor(x) = exp(alpha * max(0, cv_mu(x) - feasible_tol))
-
-The penalised acquisition becomes:
-
-    acq_penalised(x) = acq_raw(x) * penalty_factor(x)
-
-Because the acquisition is minimised:
-- predicted feasible points are unaffected
-- predicted infeasible points become less attractive
-
-6.2 Penalty parameter interpretation
-
-constraint_penalty_alpha
-- 0.0 disables the penalty GP
-- small values gently prefer feasibility
-- large values strongly suppress predicted infeasible regions
-
-feasible_tol
-- introduces a soft feasibility margin
-- useful when diagnostics are noisy
-
-7. Initial sampling strategy
-----------------------------
-
-7.1 Purpose of the initial dataset
-
-The optimiser requires an initial dataset to train the first Gaussian Process models.
-
-7.2 Initial data sources
-
-(a) CSV-based initialisation
-
-The CSV must follow:
-
-    [inputs..., objectives..., rms..., constraints...]
+Each input is defined by a dictionary with:
+- `name`
+- `min`
+- `max`
+- `step`
 
 Example:
-    # Input1, Input2, Objective1, Objective2, rms1, rms2, Constraint
-    Sol1,GunPhase,y_size,intensity,y_size_rms, intensity_rms,x_size
-    0.20,-5.0,1.2,50.0,0.05,0.08,8.0
-    0.25,-3.0,1.0,55.0,0.1,0.06,9.5
-    
-(b) Direct specification in a config file
 
-This must follow the same order as the CSV file
-
-Example:
-    # Name = Input1, Input2, Objective1, Objective2, rms1, rms2, Constraint
-    s0 = 0.20,-5.0 | 1.2,50.0 | 0.05,0.08 | 8.0
-    s1 = 0.25,-3.0 | 1.0,55.0 | 0.1,0.06 | 9.5
-
-(c) Online sampling
-
-If no CSV or config specification is provided:
-
-    no_of_meas = N
-
-Sobol sampling is used to generate N initial points.
-
-7.3 Recommendations
-
-    no_of_meas >= max(5 × number_of_inputs, 10)
-    
-Recommended to help the GP models have enough samples per input dimension to form meaningful models. The code will still run with fewer, but more iterations will be needed to reach the same end result.
-
-8. Surrogate models and noise treatment
----------------------------------------
-8.1 Objective surrogates
-
-The optimiser trains one independent Gaussian Process model per objective.
-
-8.2 Kernel and hyperparameter behaviour
-
-The objective GPs use a Matern kernel.
-
-Relevant controls include:
-- auto_length_scales
-- gp_n_restarts_optimizer
-- gp_length_scale_lower_factor
-- gp_length_scale_upper_factor
-- gp_length_scale_init_factor
-
-8.3 Measurement noise and RMS values
-
-The code supports per-sample objective noise through RMS values.
-
-In manual mode, the operator enters:
-- objective value
-- objective RMS
-
-RMS values are converted into GP observation noise via:
-
-    alpha = RMS^2
-
-If real RMS values are not supplied, the code falls back to:
-- default_objective_rms
-
-9. Evaluation modes
-------------------
-9.1 MANUAL mode
-
-Manual mode is intended for direct operator use on a machine, where the optimiser is not directly connected to the control system.
-
-For each proposed point, the code:
-1. Prints the suggested machine settings
-2. Waits for operator confirmation
-3. Prompts for each objective value
-4. Prompts for each objective RMS
-5. Prompts for each constraint value if constraints are defined
-
-9.2 GOAL_FUNCTION mode
-
-Automated mode is intended for direct attachment to the control system and automated measurements or computational studies.
-
-The user provides:
-- goal_function_path
-- goal_function_name
-
-The function must return:
-1. all objective values
-2. followed by all constraint values
-3. rms values for each objective.
-
-in the exact order declared in the configuration.
-
-10. Basic user configuration
-----------------------
-10.1 Search-space definition
-
-Inputs are defined as dictionaries containing:
-- name
-- min
-- max
-- step size
-
-Example:
-
+```python
 inputs = [
     {"name": "Sol1", "min": 0.10, "max": 0.30, "step": 0.005},
     {"name": "GunPhase", "min": -20.0, "max": 10.0, "step": 0.5},
 ]
+```
 
-10.2 Objective definition
+What each field means:
+- `name`: label used in repositories, plots, prompts, and saved files
+- `min`, `max`: hard bounds used when generating candidate points
+- `step`: stored with the search-space definition, but not enforced by the active continuous candidate-generation path
 
-Objectives are defined as dictionaries containing:
-- name
-- direction
-- ref_value
+Reasonable values:
+- `min` and `max` should reflect physically safe and meaningful limits
+- `step` should reflect the real machine resolution or a practically meaningful increment
 
-10.3 Constraint definition
+4.2 Objectives
 
-Constraints are defined as dictionaries containing:
-- name
-- sense
-- threshold
-- optional scale
+Each objective is defined by:
+- `name`
+- `direction`
+- `ref_value`
 
-10.4 Run controls
+Example:
 
-Important controls:
-- iterations
-- no_of_meas
-- batch_size
-- save_name
-- working_dir
-- goal_function_path
-- goal_function_name
-- resume
-- restart_from_iteration
+```python
+objectives = [
+    {"name": "beam_size_y", "direction": "min", "ref_value": 100.0},
+    {"name": "beam_intensity", "direction": "max", "ref_value": 100.0},
+]
+```
 
-10.5 Noise controls
-- use_real_rms
-- default_objective_rms
+What each field means:
+- `name`: label used throughout outputs
+- `direction`: either `min` or `max`
+- `ref_value`: conservative worst-case value used when clamping invalid or extreme values during some internal handling
 
-10.6 Constraint-penalty controls
-- constraint_penalty_alpha
-- feasible_tol
+Reasonable values:
+- choose `ref_value` larger than any realistic bad value you would still want represented safely in the optimisation
+- for maximisation objectives, still give the physical worst-case reference as a large bad value in physical units
 
-These affect only acquisition behaviour.
-They do not alter the hard feasibility rule used in final Pareto-front construction.
+4.3 Constraints
 
-11. Running the code
---------------------
-11.1 Python callable
+Each constraint is defined by:
+- `name`
+- `sense`
+- `threshold`
+- optional `scale`
 
-The main programmatic entry point is:
+Example:
 
-- run_mobo(...)
+```python
+constraints = [
+    {"name": "x_size", "sense": "<=", "threshold": 10.0, "scale": 10.0},
+    {"name": "charge", "sense": ">=", "threshold": 2.0, "scale": 2.0},
+]
+```
 
-The code also provides:
+Constraint violation is computed as:
+- `<=`: `max(0, value - threshold)`
+- `>=`: `max(0, threshold - value)`
 
-- run_mobo_from_config(...)
+The combined scalar violation used by the optimiser is:
 
-for use with a pre-constructed config file (alternative to in-script definition).
+    CV = max(per_constraint_violations)
 
-11.2 Config file mode
+Important implementation note:
+The code only applies constraint scaling if the in-memory constraint dictionaries include `normalise=True`. The public config parser and normal example definitions do not currently add that flag, so in ordinary public usage `scale` is stored but not usually applied.
 
-A minimal configuration file should include:
-- [INPUTS]
-- [OBJECTIVES]
+4.4 Penalties
 
-and typically also:
-- [GENERAL]
-- [CONSTRAINTS]
-- [INITIAL_SAMPLES]
+Penalties are separate from hard constraints. They define preferred ranges for additional measured quantities and convert deviations outside those ranges into a smooth exponential penalty.
 
-12. Output files and run artefacts
-----------------------------------
-Run outputs are written under:
+Each penalty dictionary has:
+- `name`
+- `lower`
+- `upper`
+- `scale`
+- `rate`
 
-- working_dir/Outputs/<DATE>_<save_name>/
+The penalty for a raw value `v` is zero inside `[lower, upper]` and rises as:
 
-Checkpoints are stored under:
+    scale * (exp(rate * distance_outside_range) - 1)
 
-- working_dir/Benchmarks/
+The total penalty is the sum across all penalties, and that total is added to every objective value in the penalised objective representation.
 
-Typical output files include:
-- final Pareto front
-- initial Pareto front
-- full input repository
-- full objective repository
-- Pareto input coordinates
-- Pareto RMS values
-- metadata JSON
-- pickled GP models
-- raw evaluator outputs
-- constraint values
-- constraint violations
-- GP length-scale histories
-- metric histories such as hypervolume and spacing
+Practical interpretation:
+- penalties are soft preferences, not hard feasibility conditions
+- use constraints for protection or strict acceptability
+- use penalties for “prefer this region, but do not ban everything else” behaviour
 
-13. Practical operating guidance for accelerator studies
---------------------------------------------------------
-For real machine optimisation, a reliable operating pattern is:
-- keep bounds conservative at the beginning
-- use a small initial design
-- start with batch_size = 1
-- supply realistic RMS values whenever possible
-- encode machine protection or minimum usability conditions as explicit constraints
-- enable constraint penalisation if infeasible evaluations are expensive or risky
+Reasonable values:
+- `lower`, `upper`: the preferred acceptable interval
+- `scale`: how strongly the penalty matters compared with objective magnitudes
+- `rate`: how sharply the penalty rises outside the interval
 
-14. Implementation notes and limitations
+Config-file caveat:
+In config files, penalty values are later passed through `float(...)`. Use plain numeric text or `inf`, not `np.inf`.
+
+5. Initial data handling
+------------------------
+The code chooses initial data in this order:
+
+1. If `training_csv_path` exists, load it.
+2. Else, if `initial_samples` exist, use them.
+3. Else, generate and evaluate `no_of_meas` random initial points inside the bounds.
+
+5.1 CSV-based initialisation
+
+The expected CSV layout is:
+
+    [inputs..., objectives..., errors..., constraints..., penalties...]
+
+More explicitly:
+- first `n_inputs` columns: inputs
+- next `n_obj` columns: objective values
+- next `n_obj` columns: per-objective errors
+- next `n_con` columns: raw constraint values
+- next `n_pen` columns: raw penalty values
+
+If error columns are missing, the code fills them with `default_objective_error`.
+
+Practical advice:
+- always keep the column order exactly consistent with your configured inputs, objectives, constraints, and penalties
+- do not rely on header names alone; the loader slices by column position
+
+5.2 Explicit initial samples
+
+Initial samples can be supplied in Python as a list of dictionaries or in config-file form under `[INITIAL_SAMPLES]`.
+
+Each sample may contain:
+- `X`: inputs
+- `Y`: objectives
+- `error`: objective errors
+- `C`: raw constraint values
+- `P`: raw penalty values
+
+Example:
+
+```python
+initial_samples = [
+    {
+        "X": [0.2, -5.0],
+        "Y": [1.2, 50.0],
+        "error": [0.05, 0.08],
+        "C": [8.0],
+        "P": [0.2],
+    }
+]
+```
+
+Any omitted optional field is replaced with defaults.
+
+5.3 Online initial sampling
+
+If neither a CSV nor explicit samples are given, the code generates `no_of_meas` initial points uniformly at random inside the bounds and evaluates them.
+
+5.4 Recommended size of the initial dataset
+
+A reasonable practical starting point is:
+
+    no_of_meas >= max(5 * number_of_inputs, 10)
+
+More initial data generally gives stabler GP fits, but the best choice depends on the evaluation budget.
+
+6. Surrogate models and noise handling
+--------------------------------------
+6.1 Objective GPs
+
+The optimiser trains one independent `GaussianProcessRegressor` per objective, using a Matern kernel.
+
+6.2 GP fitting
+
+During optimisation, each objective GP is fit on:
+- `input_repository`
+- one column of `output_repository`
+
+If objective errors are available, the code sets:
+
+    alpha = clip(error^2, 1e-12, inf)
+
+for that objective GP before fitting.
+
+This means the `error` values are interpreted as per-sample standard deviations, not variances.
+
+6.3 Constraint-violation GP
+
+If constraints are defined and `constraint_penalty_alpha > 0`, the code also fits a separate GP to the scalar `CV` repository. This model is used only for acquisition penalisation, not for the hard final Pareto feasibility rule.
+
+6.4 GP length scales
+
+The config object contains these fields:
+- `auto_length_scales`
+- `gp_n_restarts_optimizer`
+- `gp_length_scale_lower_factor`
+- `gp_length_scale_upper_factor`
+- `gp_length_scale_init_factor`
+
+The internal defaults are:
+- `auto_length_scales = True`
+- `gp_n_restarts_optimizer = 5`
+- `gp_length_scale_lower_factor = 1e-6`
+- `gp_length_scale_upper_factor = 10.0`
+- `gp_length_scale_init_factor = 0.2`
+
+Meaning:
+- `auto_length_scales`: whether initial GP length scales are derived from the spread of the existing input data
+- `gp_n_restarts_optimizer`: number of optimiser restarts when fitting the GP hyperparameters
+- `gp_length_scale_lower_factor`: lower bound multiplier applied to the observed input range in each dimension
+- `gp_length_scale_upper_factor`: upper bound multiplier applied to the observed input range in each dimension
+- `gp_length_scale_init_factor`: initial length-scale multiplier applied to the observed input range
+
+Important user-facing caveat:
+These fields exist and are used internally, but the public `run_mobo(...)` and text-config loader do not expose them as user-tunable settings. They are effectively fixed to their internal defaults unless you modify the code.
+
+7. Acquisition function and candidate selection
+-----------------------------------------------
+7.1 Active method
+
+The active acquisition method is `BATCH_UCB`.
+
+7.2 Raw acquisition score
+
+For each candidate point and each objective GP, the code predicts:
+- mean `mu_j(x)`
+- standard deviation `sigma_j(x)`
+
+It then forms:
+
+    acq_raw(x) = sum_j [ mu_j(x) - beta * sigma_j(x) ]
+
+Lower values are preferred.
+
+The code sets `beta = 2.5` internally.
+
+7.3 Objective weighting
+
+If `weighting=True`, the acquisition uses:
+
+    acq_raw(x) = sum_j [ weight_j * (mu_j(x) - beta * sigma_j(x)) ]
+
+Important note:
+The weights affect only acquisition aggregation. They do not change the raw stored objectives, Pareto definition, or final feasibility rule.
+
+Reasonable values:
+- all ones for equal treatment
+- values larger than one for objectives you want to emphasise more strongly
+- keep magnitudes moderate at first, for example between `0.5` and `5.0`
+
+7.4 Constraint penalty during acquisition
+
+If a CV GP exists and `constraint_penalty_alpha > 0`, the code applies:
+
+    penalty_factor(x) = exp(alpha * max(0, cv_mu(x) - feasible_tol))
+    acq_penalised(x) = acq_raw(x) * penalty_factor(x)
+
+Interpretation:
+- `constraint_penalty_alpha = 0.0` disables this path
+- larger `constraint_penalty_alpha` means stronger avoidance of predicted infeasible regions
+- `feasible_tol` adds a soft tolerance margin for noisy constraints
+
+Reasonable values:
+- `constraint_penalty_alpha`: start around `0.1` to `2.0`
+- `feasible_tol`: `0.0` for strict feasibility, or a small positive value reflecting realistic measurement noise
+
+7.5 Batch construction
+
+The batch selector chooses the best point under the penalised acquisition, then greedily modifies the working acquisition with a diversity penalty before selecting the next batch member.
+
+This encourages some spread within the batch instead of choosing nearly identical points.
+
+7.6 Candidate generation
+
+The initial online sampling path is uniform random.
+- candidates are generated inside the configured bounds
+- previously sampled points are filtered out within a tolerance
+- the public behaviour is continuous rather than strictly snapped to `step`
+
+8. Evaluation modes
+-------------------
+8.1 MANUAL mode
+
+In manual mode the optimiser:
+1. prints the machine settings for the proposed point
+2. waits for the user to press Enter
+3. prompts for each objective value
+4. prompts for each objective error
+5. prompts for each constraint value if constraints are defined
+
+Manual mode does not ask for penalty values. If you configure penalties, they are not naturally supplied through the public manual evaluator path.
+
+8.2 GOAL_FUNCTION mode
+
+In goal-function mode the optimiser imports a Python callable and evaluates points automatically.
+
+Required settings:
+- `goal_function_path`
+- `goal_function_name`
+
+Optional setting:
+- `goal_function_kwargs`
+
+The call shape is:
+
+```python
+goal_function(x.reshape(1, -1), **goal_function_kwargs)
+```
+
+8.3 Accepted goal-function return schema
+
+The most convenient return format is a dictionary such as:
+
+```python
+{
+    "objectives": [obj1, obj2, ...],
+    "errors": [err1, err2, ...],
+    "constraints": [con1, con2, ...],
+    "penalties": [pen1, pen2, ...],
+}
+```
+
+Accepted keys:
+- `objectives` or `objs`
+- `constraints` or `cons`
+- `errors`
+- `penalties`
+- `raw`
+
+Rules in the code:
+- if `raw` is present, it is used as the objective vector and must have length equal to the number of objectives
+- if `constraints` are omitted and constraints are configured, zeros are assumed
+- if `penalties` are omitted and penalties are configured, zeros are assumed
+- if `errors` are omitted, `default_objective_error` is used
+
+The bundled example goal function returns a dictionary with `objectives`, `errors`, and `constraints`.
+
+8.4 Multiprocessing
+
+If `multiprocess_bool=True` in `GOAL_FUNCTION` mode, batch evaluations are dispatched through a multiprocessing pool using all available CPU cores.
+
+Use it only when:
+- the goal function is safe to run in parallel
+- required imports and external resources are available to worker processes
+- the evaluation truly benefits from parallel execution
+
+9. Public configuration options
+-------------------------------
+This section explains the user-facing options available through `run_mobo(...)` or the config file.
+
+9.1 Search-space options
+
+`inputs`
+- sequence of input dictionaries
+- required
+- use one entry per controllable variable
+
+Reasonable values:
+- bounds should reflect safe operational limits
+- the wider the bounds, the harder the optimisation usually becomes
+
+9.2 Objective options
+
+`objectives`
+- sequence of objective dictionaries
+- required
+
+Reasonable values:
+- include only quantities you really want the optimiser to trade off
+- use consistent units and names that will still make sense in saved outputs
+
+9.3 Constraint options
+
+`constraints`
+- optional sequence of constraint dictionaries
+
+Reasonable values:
+- use for strict machine protection, minimum acceptable beam transport, or quality limits that should determine feasibility
+
+9.4 Penalty options
+
+`penalties`
+- optional sequence of penalty dictionaries
+
+Reasonable values:
+- use for soft preferences where a graded penalty is more appropriate than a hard reject
+
+9.5 Run-control options
+
+`evaluation_method`
+- supported public values: `MANUAL`, `GOAL_FUNCTION`
+- aliases accepted for goal-function mode: `GOAL`, `FUNC`, `FUNCTION`
+
+`iterations`
+- number of Bayesian iterations after initialisation
+- reasonable values: often 20 to 100+, depending on budget and dimensionality
+
+`no_of_meas`
+- number of online initial samples when no CSV or initial samples are supplied
+- reasonable values: start from `max(5 * n_inputs, 10)` when possible
+
+`batch_size`
+- number of candidates chosen per iteration
+- reasonable values: `1` for machine work, `2` to `8` for safe parallel simulation studies if evaluation truly runs in parallel
+
+`save_name`
+- name prefix for saved results
+- use a short descriptive label for each run
+
+`working_dir`
+- root directory for all saved artefacts
+- typically a dedicated run folder
+
+`outputs_dirname`
+- name of the outputs subdirectory under `working_dir`
+- default `Outputs`
+
+`benchmarks_dirname`
+- name of the checkpoint subdirectory under `working_dir`
+- default `Benchmarks`
+
+9.6 Noise options
+
+`use_real_error`
+- if `True`, use supplied objective errors as GP observation noise
+- if `False`, ignore supplied errors and fill all noise values with `default_objective_error`
+
+`default_objective_error`
+- fallback standard deviation for each objective measurement
+- should be small and positive
+
+Reasonable values:
+- choose based on realistic repeatability or known noise floor
+- avoid exact zero
+
+9.7 Goal-function options
+
+`goal_function_path`
+- path to the Python file or module containing the callable
+
+`goal_function_name`
+- callable name inside that file or module
+- usually `goal_function`
+
+`goal_function_kwargs`
+- optional dictionary passed into every goal-function call
+- good for constant settings that should be recorded for later reproducibility
+
+In text configs this must be valid JSON.
+
+9.8 Initial-data option
+
+`training_csv_path`
+- if set to an existing file, that CSV is loaded as the initial dataset and takes precedence over generated initial points
+
+9.9 Acquisition-penalty options
+
+`constraint_penalty_alpha`
+- strength of soft infeasibility avoidance during acquisition
+- `0.0` disables it
+
+`feasible_tol`
+- soft tolerance around zero violation for that acquisition penalty
+
+These settings do not change the final hard feasibility-first Pareto rule.
+
+9.10 Resume and restart options
+
+`resume`
+- if `True`, attempt to load an existing checkpoint file and continue
+
+`restart_from_iteration`
+- optional 0-based iteration index used when truncating a resumed run
+
+Practical caution:
+The restart/truncation path exists in the current implementation, but it is more fragile than the basic fresh-run path. Use it carefully and prefer a clean rerun if the saved state is uncertain.
+
+10. Config-file format
+----------------------
+A minimal config file must contain:
+- `[INPUTS]`
+- `[OBJECTIVES]`
+
+Commonly used additional sections:
+- `[CONSTRAINTS]`
+- `[PENALTIES]`
+- `[INITIAL_SAMPLES]`
+- `[GENERAL]`
+
+10.1 `[INPUTS]`
+
+Format:
+
+    name = min, max, step
+
+10.2 `[OBJECTIVES]`
+
+Format:
+
+    name = direction, reference_point
+
+10.3 `[CONSTRAINTS]`
+
+Format:
+
+    name = sense, threshold
+
+or:
+
+    name = sense, threshold, scale
+
+10.4 `[PENALTIES]`
+
+Format:
+
+    alias = name, lower, upper, scale, rate
+
+Because of how the parser is written, the key to the left of `=` is not the final stored penalty name. The first comma-separated field on the right-hand side becomes the stored `name`.
+
+Example penalty 'intensity':
+
+    p0 = intensity, 0, inf, 2, 2
+
+10.5 `[INITIAL_SAMPLES]`
+
+Format:
+
+    s0 = x1, x2, ... | obj1, obj2, ... | err1, err2, ... | con1, con2, ... | pen1, pen2, ...
+
+Only the fields relevant to your configuration need to be meaningful, but lengths should match the configured numbers of inputs, objectives, constraints, and penalties. A CSV file with initial samples saved is preferred to config [INITIAL_SAMPLES]
+
+10.6 `[GENERAL]`
+
+The parser currently reads these keys:
+- `evaluation_method`
+- `weighting`
+- `weight`
+- `iterations`
+- `no_of_meas`
+- `batch_size`
+- `save_name`
+- `resume`
+- `restart_from_iteration`
+- `multiprocess_bool`
+- `use_real_error`
+- `default_objective_error`
+- `goal_function_path`
+- `goal_function_name`
+- `goal_function_kwargs`
+- `model_path`
+- `training_csv_path`
+- `feasible_tol`
+- `constraint_penalty_alpha`
+- `working_dir`
+
+11. Saved outputs and artefacts
+-------------------------------
+Under:
+
+    working_dir/Outputs/<save_name>/
+
+the code saves at least these main files:
+- `_raw_repository.csv`
+- `_raw_repository_pareto.csv`
+- `_metrics_repository.csv`
+- `_metadata.json`
+- `_run_config.json`
+- `_gp_models.pkl`
+- `_goal_function_source.py` when the goal-function source file exists
+
+11.1 Raw repository columns
+
+The raw repository file includes columns for:
+- iteration
+- inputs
+- objective values
+- objective errors
+- raw constraint values
+- processed constraint values
+- the scalar combined constraint value used by the optimiser
+- raw penalty values
+- processed penalty values
+- total penalty
+
+11.2 Metrics repository
+
+The metrics repository includes the standard tracked metrics for each iteration, such as:
+- iteration
+- hypervolume
+- generational distance
+- diversity
+- spacing
+- Pareto-front count
+- runtime
+- goal-function kwargs summary
+
+11.3 Metadata
+
+The metadata JSON includes:
+- the config values
+- timestamp
+- evaluation method
+- inputs, objectives, and constraints specifications
+- goal-function path, name, and kwargs used
+
+12. Practical operating guidance
+--------------------------------
+For real machine studies:
+- start with conservative bounds
+- begin with `batch_size = 1`
+- supply realistic objective errors whenever possible
+- encode hard operational limits as constraints
+- use soft penalties only for preference shaping, not protection
+- enable `constraint_penalty_alpha` when infeasible evaluations are expensive or risky
+- keep clear notes on the meaning and units of every objective and constraint name
+
+13. Implementation notes and limitations
 ----------------------------------------
-1. The currently active and supported acquisition path is BATCH_UCB.
-2. The input step field is not strictly enforced in the active Sobol-based search path. This is to reduce the time taken to locate the next sampling points.
-3. Objective GPs are independent
-4. The GP-based constraint penalty is the main supported penalty mechanism.
+1. The active public evaluator support is `MANUAL` and `GOAL_FUNCTION` only.
+2. The active public optimisation path is `BATCH_UCB`.
+3. The `step` field is not strictly enforced by the active candidate-generation path.
+4. Objective GPs are independent; there is no joint multi-output GP.
+5. Constraint scaling through `scale` is not normally applied unless `normalise=True` is added manually in memory.
+6. GP hyperparameter controls exist internally but are not publicly exposed through `run_mobo(...)` or the text config loader.
+7. The restart/truncation path exists but should be treated with care.
 
-15. Summary
+14. Summary
 -----------
-This package implements a constraint-aware, physics-oriented, multi-objective Bayesian optimisation workflow based on:
+The current codebase implements a practical, constraint-aware MOBO workflow built around:
 - independent Matern-kernel Gaussian Processes
 - feasibility-first Pareto ranking
-- batch greedy UCB acquisition
-- optional GP-based penalisation of predicted constraint violations
-- explicit support for measurement noise through per-objective RMS values
+- batch UCB acquisition
+- optional objective weighting in acquisition
+- optional GP-based penalisation of predicted infeasible regions
+- optional soft region penalties added to objectives
+- explicit support for per-objective measurement error
 
-For most practical accelerator applications, the most influential user choices are:
-- the physical definition of the constraints
-- the realism of the supplied RMS values
-- the choice of conservative and physically meaningful input bounds
-- the strength of the acquisition penalty against predicted infeasible points
+The settings that usually matter most in practice are:
+- realistic input bounds
+- physically meaningful objective definitions
+- clear hard constraints
+- realistic objective-error estimates
+- whether soft infeasibility penalisation is strong enough for your machine or simulation budget
