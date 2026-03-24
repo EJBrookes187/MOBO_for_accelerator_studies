@@ -1218,8 +1218,6 @@ class BatchOptimiser(Optimiser):
             # Fit Gaussian Processes
             logging.info(f"Iteration {i} - Fitting GP")
             default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
-
-            print(self.output_repository)
             
             for j, gp in enumerate(self.gp_models):
                 y = self.output_repository[:, j]
@@ -1355,10 +1353,18 @@ class BatchOptimiser(Optimiser):
             elapsed = time.perf_counter() - start
             
 
-            # Update metrics 
+            # Update metrics and save PF for this iteration
             pf, pf_idx = compute_pareto_front_constrained(self.output_repository, self.experiment.constraint_repository)
-            pf_input = self.input_repository[pf_idx]
+            pf_input = pd.DataFrame(self.input_repository[pf_idx])
+            pf_samples = pd.DataFrame(self.output_repository[pf_idx])
             pf_error = self.error_repository[pf_idx]
+            pf_points = pd.concat([pf_input, pf_samples],axis=1)
+            input_labels = list([str(o["name"]) for o in self.experiment.inputs_spec])
+            output_labels = list([str(o["name"]) for o in self.experiment.objectives_spec])
+            total_labels=list(np.concat([input_labels, output_labels]))
+            pf_points.columns=total_labels
+            pf_points.to_csv('Current_pareto_front.csv')
+            
             hv = Metrics.hypervolume(pf, self.experiment.reference_point)
             gd = Metrics.generational_distance(pf, self.experiment.best_pareto_front)
             div = Metrics.diversity(pf)
@@ -2119,7 +2125,6 @@ class MOBOPlotter:
     show=False,
     max_candidates=None):
         print('GP plotting')
-        print(error_train)
         if save_path==None:
             save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_over_inputs_iter_{iteration}.png")
             save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_over_inputs.png")
@@ -2512,7 +2517,6 @@ class MOBOPlotter:
         """
         import math
         print('Plotting sliced GPs')
-        print(error_train)
         if save_path==None:
             save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_sliced_iter_{iteration}.png")
             save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_sliced.png")
