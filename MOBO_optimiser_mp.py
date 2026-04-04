@@ -24,6 +24,7 @@ import time
 import pandas as pd
 import subprocess
 import json
+from datetime import datetime
 
 def _get_working_dir(config):
     wd = getattr(config, 'working_dir', None) or '.'
@@ -58,7 +59,7 @@ def compute_pareto_front_constrained(Y, CV):
         pf_idx = idx_feas[nd_local]
         return Y[pf_idx], pf_idx
 
-    # Case 2: all infeasible → minimum charge loss
+    # Case 2: all infeasible
     best = np.min(CV)
     pf_idx = np.where(CV == best)[0]
     return Y[pf_idx], pf_idx
@@ -390,6 +391,7 @@ class InitialSetup():
         self.nu = nu
         self.Eve = Eve
         self.experiment = experiment
+        self.config = experiment.config
         self.plotter = MOBOPlotter()
 
         # GP length-scale history (saved each iteration for post-analysis)
@@ -410,6 +412,7 @@ class InitialSetup():
         self.constraint_value_pool = None
         self.constraint_violation_pool = None
         self.penalty_raw_pool = None
+        self.penalty_value_pool = None
         self.input_scaler = None
         self.output_scaler = None
 
@@ -537,13 +540,14 @@ class InitialSetup():
         X_pool = self.rng.uniform(bounds[:, 0], bounds[:, 1], size=(N_POOL, n_inputs))
 
         # Evaluate pool
+        aux = None
         if hasattr(self.evaluator, "evaluate_batch"):
             raw_outputs, error_outputs, con_outputs, pen_raw_outputs = self.experiment.evaluator.evaluate_batch(X_pool)
         else:
             results = [self.evaluator.evaluate(x.reshape(1, -1)) for x in X_pool]
             raw_outputs = np.vstack([r[0].squeeze() for r in results])
-            rcon_outputs = np.vstack([r[2].squeeze() for r in results])
-            aux = None
+            con_outputs = np.vstack([r[2].squeeze() for r in results])
+            pen_raw_outputs = np.empty((len(results), 0), dtype=float)
             if len(results) > 0 and isinstance(results[0], (tuple, list)) and len(results[0]) > 1:
                 aux = np.vstack([np.atleast_1d(r[1]).squeeze() for r in results])
 
@@ -561,9 +565,11 @@ class InitialSetup():
         self.experiment.constraint_pool = np.asarray(CV_pool, dtype=float)
         self.experiment.constraint_values_pool = np.asarray(C_pool, dtype=float)
         self.experiment.constraint_violations_pool = np.asarray(V_pool, dtype=float)
-        self.penalty_raw_pool = np.asarray(penalty_raw, dtype=float)
-        self.penalty_value_pool = np.asarray(penalty_value, dtype=float)
-        self.penalty_total_pool = np.asarray(penalty_total, dtype=float)
+        self.penalty_raw_pool = np.asarray(penalty_raw_pool, dtype=float)
+        self.penalty_value_pool = np.asarray(penalty_value_pool, dtype=float)
+        self.penalty_total_pool = np.asarray(penalty_total_pool, dtype=float)
+        self.experiment.penalty_raw_pool = self.penalty_raw_pool
+        self.experiment.penalty_value_pool = self.penalty_value_pool
 
         # error
         default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
@@ -575,7 +581,7 @@ class InitialSetup():
         if use_real_error==False:
             error_pool = np.full((n_pool, n_obj), default_error, dtype=float)
         else:
-            error_pool = self.error_pool
+            error_pool = np.asarray(error_outputs, dtype=float) if 'error_outputs' in locals() and error_outputs is not None else np.full((n_pool, n_obj), default_error, dtype=float)
 
         if str(self.experiment.config.evaluation_method).upper() == "MANUAL" and use_real_error and aux is not None:
             aux_arr = np.asarray(aux, dtype=float)
@@ -598,13 +604,18 @@ class InitialSetup():
         self.constraint_violation_pool = np.asarray(V_pool, dtype=float)
         self.error_pool = np.asarray(error_pool, dtype=float)
 
+        n_err = self.error_pool.shape[1] if np.ndim(self.error_pool) > 1 else 1
+        n_con = self.constraint_value_pool.shape[1] if np.ndim(self.constraint_value_pool) > 1 else 0
+        n_pen = self.penalty_raw_pool.shape[1] if np.ndim(self.penalty_raw_pool) > 1 else 0
+        
+
         logger.info(
             f"Generated pool: {len(self.input_pool)} rows, "
             f"{self.input_pool.shape[1]} inputs, "
             f"{self.output_pool.shape[1]} objectives, "
-            f"{self.error_pool.shape[1]} errors, "
-            f"{self.constraint_pool.shape[1]} constraints, "
-            f"{np.shape(self.penalty_raw_pool)[0]} penalties"
+            f"{n_err} errors, "
+            f"{n_con} constraints, "
+            f"{n_pen} penalties"
         )
 
 
@@ -644,24 +655,35 @@ class InitialSetup():
         C0 = self.constraint_value_pool[chosen_idx]
         V0 = self.constraint_violation_pool[chosen_idx]
         PEN0 = self.penalty_raw_pool[chosen_idx]
+        PEN_val = self.penalty_value_pool[chosen_idx]
         error0=self.error_pool[chosen_idx]
 
 
         # Store per-constraint values/violations + raw outputs for the chosen initial samples
-        if hasattr(self, "constraint_values_pool"):
-            self.constraint_values_init = np.asarray(self.experiment.constraint_values_pool)[chosen_idx, :]
+        if self.constraint_value_pool is not None:
+            self.constraint_values_init = np.asarray(self.constraint_value_pool)[chosen_idx, :]
         else:
             self.constraint_values_init = np.empty((len(chosen_idx), 0), dtype=float)
 
-        if hasattr(self, "constraint_violations_pool"):
-            self.constraint_violations_init = np.asarray(self.experiment.constraint_violations_pool)[chosen_idx, :]
+        if self.constraint_violation_pool is not None:
+            self.constraint_violations_init = np.asarray(self.constraint_violation_pool)[chosen_idx, :]
         else:
             self.constraint_violations_init = np.empty((len(chosen_idx), 0), dtype=float)
 
-        if hasattr(self, "penalty_raw_pool"):
-            self.penalty_init = np.asarray(self.experiment.penalty_raw_pool)[chosen_idx, :]
+        if self.penalty_raw_pool is not None:
+            self.penalty_init = np.asarray(self.penalty_raw_pool)[chosen_idx, :]
         else:
             self.penalty_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.penalty_value_pool is not None:
+            self.penalty_value_init = np.asarray(self.penalty_value_pool)[chosen_idx, :]
+        else:
+            self.penalty_value_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.penalty_total_pool is not None:
+            self.penalty_total_init = np.asarray(self.penalty_total_pool)[chosen_idx]
+        else:
+            self.penalty_total_init = np.zeros(len(chosen_idx), dtype=float)
 
         if hasattr(self, "raw_pool"):
             self.raw_init = np.asarray(self.raw_pool)[chosen_idx, :]
@@ -672,7 +694,7 @@ class InitialSetup():
 
         #print('c0: ',C0)
 
-        return X0, Y0, CV0, error0, C0, V0, PEN0
+        return X0, Y0, CV0, error0, C0, V0, PEN0, PEN_val
 
 
     def clamp_outputs_to_reference(self, Y: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -758,16 +780,18 @@ class InitialSetup():
         self.penalty_value_pool = penalty_value
         self.penalty_total_pool = penalty_total
 
-        return X, Y, CV, error, C, V, penalty_raw
+        return X, Y, CV, error, C, V, penalty_raw, penalty_value
 
     def run(self, no_of_init_samples: int = 10, ensure_min_distance: Optional[float] = None) -> InitialSetupResult:
         logger = logging.getLogger("InitialSetup")
-        self.load_and_clean()
+        # self.load_and_clean()
 
         if self.csv_path and Path(self.csv_path).exists():
+            logger.info(self.csv_path)
             self.load_and_clean()
             X_init = self.input_pool
             Y_init = self.output_pool
+            
             expected_n_obj = len(self.experiment.objectives_spec)
 
             if Y_init.shape[1] != expected_n_obj:
@@ -779,11 +803,13 @@ class InitialSetup():
             C_init = self.constraint_value_pool
             V_init = self.constraint_violation_pool
             Pen_init = self.penalty_raw_pool
+            Pen_init_val = self.penalty_value_pool
             error_init = self.error_pool
             no_of_init_samples = len(Y_init)
 
         elif self.experiment.config.initial_samples:
-            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init = self._use_config_initial_samples()
+            # logger.info('config samples')
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init, Pen_init_val = self._use_config_initial_samples()
             expected_n_obj = len(self.experiment.objectives_spec)
 
             if Y_init.shape[1] != expected_n_obj:
@@ -794,16 +820,25 @@ class InitialSetup():
             no_of_init_samples = len(Y_init)
 
         else:
-            self.load_and_clean()
-            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init = self.choose_initial_samples(no_of_init_samples, ensure_min_distance=ensure_min_distance)
+            logger.info('Initiating samples')
+            # self.load_and_clean()
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init, Pen_init_val = self.choose_initial_samples(no_of_init_samples, ensure_min_distance=ensure_min_distance)
+
+            CV_init = self.constraint_pool
+            C_init = self.constraint_value_pool
+            V_init = self.constraint_violation_pool
+            Pen_init = self.penalty_raw_pool
+            Pen_init_val = self.penalty_value_pool
+            error_init = self.error_pool
+            no_of_init_samples = len(Y_init)
 
             expected_n_obj = len(self.experiment.objectives_spec)
-
             if Y_init.shape[1] != expected_n_obj:
                 raise ValueError(
                     f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
                     f"but config defines {expected_n_obj}"
                 )
+        
         #print('c_init3: ',C_init)
         
         self.experiment.Y_init=Y_init
@@ -828,6 +863,7 @@ class InitialSetup():
                 title=str(self.experiment.config.working_dir) + "/Outputs/_3D_initial_PF"
             )
 
+        self.experiment.raw_repository = np.asarray(self.output_pool, dtype=float)
         # Reference point
         if self.reference_point is None:
             self.reference_point = np.max(self.output_pool, axis=0) + 1e6
@@ -863,6 +899,10 @@ class InitialSetup():
 
         # Guarantee shape (n_init, n_obj)
         n_init = X_init.shape[0]
+        init_timestamp = datetime.now().isoformat(timespec="seconds")
+        if getattr(self.experiment, "timestamp_repository", None) is None or len(self.experiment.timestamp_repository) == 0:
+            self.experiment.timestamp_repository = np.array([init_timestamp] * n_init, dtype=object)
+
         self.experiment.iteration_repository = np.zeros(n_init, dtype=int)
         for i in range(len(self.experiment.iteration_repository)):
             self.experiment.iteration_repository[i]=-1
@@ -881,13 +921,16 @@ class InitialSetup():
         self.experiment.error_repository = error_init
 
         # Store full raw outputs + per-constraint values/violations for post-analysis
-        self.experiment.raw_repository = getattr(self, "raw_init", np.empty((len(X_init), 0), dtype=float))
+        if hasattr(self, "raw_init"):
+            self.experiment.raw_repository = np.asarray(self.raw_init, dtype=float)
+        else:
+            self.experiment.raw_repository = np.asarray(Y_init, dtype=float)
         self.experiment.constraint_repository = np.asarray(CV_init).reshape(-1)
         self.experiment.constraint_values_repository = np.asarray(C_init)
         self.experiment.constraint_violations_repository = np.asarray(V_init)
         self.experiment.penalty_raw_repository = np.asarray(Pen_init, dtype=float)
-        self.experiment.penalty_value_repository = np.asarray(self.penalty_value_pool[:len(X_init)], dtype=float)
-        self.experiment.penalty_total_repository = np.asarray(self.penalty_total_pool[:len(X_init)], dtype=float)
+        self.experiment.penalty_value_repository = np.asarray(Pen_init_val, dtype=float)
+        self.experiment.penalty_total_repository = np.asarray(getattr(self, "penalty_total_init", np.zeros(len(X_init))), dtype=float)
         
 
         best_pf, best_idx = compute_pareto_front_constrained(self.output_pool, self.constraint_pool)
@@ -917,9 +960,10 @@ class Optimiser(ABC):
         self.weight = experiment.config.weight
         self.reference_point = experiment.reference_point
         self.input_repository = experiment.input_repository
-        self.output_repository = experiment.output_repository
+        self.experiment.output_repository = experiment.output_repository
         self.error_repository = experiment.error_repository
         self.penalty_raw_repository = np.empty(0)
+        self.penalty_value_repository = np.empty(0)
         self.input_bounds = experiment.config.input_bounds
         self.nu = experiment.config.nu
         self.gp_models = self._build_gp_models()
@@ -941,7 +985,7 @@ class BatchOptimiser(Optimiser):
         self.weight = experiment.config.weight
         self.reference_point = experiment.reference_point
         self.input_repository = experiment.input_repository
-        self.output_repository = experiment.output_repository
+        self.experiment.output_repository = experiment.output_repository
         self.constraint_repository = experiment.constraint_repository
         self.constraint_values_repository = experiment.constraint_values_repository
         self.constraint_violations_repository = experiment.constraint_violations_repository
@@ -963,23 +1007,30 @@ class BatchOptimiser(Optimiser):
         self.logger = logging.getLogger("MOBO_outputs")
         self.plotter = MOBOPlotter()
         n_pen = len(self.experiment.penalties or [])
-        self.penalty_raw_repository = np.empty((0, n_pen), dtype=float)
-        self.penalty_value_repository = np.empty((0, n_pen), dtype=float)
-        self.penalty_total_repository = np.empty((0,), dtype=float)
+        self.penalty_raw_repository = np.asarray(getattr(experiment, "penalty_raw_repository", np.empty((0, n_pen))), dtype=float)
+        self.penalty_value_repository = np.asarray(getattr(experiment, "penalty_value_repository", np.empty((0, n_pen))), dtype=float)
+        self.penalty_total_repository = np.asarray(getattr(experiment, "penalty_total_repository", np.empty((0,))), dtype=float)
 
         # GP length-scale history (saved each iteration for post-analysis)
         self.gp_length_scales_history = []  # list of (n_obj, n_dim) arrays
         self.cv_gp_length_scales_history = []  # list of (n_dim,) arrays (or nan)
 
+        self.HV = []
+        self.GD = []
+        self.Diversity = []
+        self.Spacing = []
+        self.Count = []
+        self.runtime_records = []
+
     def _build_gp_models(self):
         """
         Build one Gaussian Process model per objective.
         """
-        n_outputs = self.output_repository.shape[1]
+        n_outputs = self.experiment.output_repository.shape[1]
         gp_models = []
 
         # Automatic GP length-scale handling
-        # Hyperparameters (including length_scales) are re-optimised on every gp.fit() call via sklearn's optimizer.
+        # Hyperparameters (including length_scales) are re-optimised on every gp.fit()
         X0 = np.asarray(self.input_repository, dtype=float)
         d = X0.shape[1]
         ranges = np.ptp(X0, axis=0)
@@ -1007,7 +1058,7 @@ class BatchOptimiser(Optimiser):
 
         for i in range(n_outputs):
             X = self.input_repository
-            y = self.output_repository[:, i]
+            y = self.experiment.output_repository[:, i]
             kernel = Matern(length_scale=initial_length_scales, length_scale_bounds=length_scale_bounds_revisited, nu=self.nu)
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=n_restarts, normalize_y=True)
             gp.fit(X, y)
@@ -1016,23 +1067,17 @@ class BatchOptimiser(Optimiser):
 
     @staticmethod
     def _extract_length_scales_from_kernel(kernel, n_dim: int):
-        """Best-effort extraction of per-dimension length scales from a fitted sklearn kernel
-        Returns a 1D array, or None if not found.
-        """
         try:
-            # Direct attribute on kernels like Matern/RBF
             if hasattr(kernel, "length_scale"):
                 ls = np.asarray(getattr(kernel, "length_scale"), dtype=float)
                 if ls.ndim == 0:
                     return np.full(n_dim, float(ls), dtype=float)
                 if ls.size == n_dim:
                     return ls.reshape(-1)
-                # If mismatch, try to broadcast a single value
                 if ls.size == 1:
                     return np.full(n_dim, float(ls.reshape(-1)[0]), dtype=float)
                 return None
 
-            # Recurse into composed kernels
             for child_name in ("k1", "k2", "base_kernel"):
                 if hasattr(kernel, child_name):
                     child = getattr(kernel, child_name)
@@ -1044,23 +1089,163 @@ class BatchOptimiser(Optimiser):
         return None
 
 
+    @staticmethod
+    def _as_2d(arr, n_rows=None):
+        arr = np.asarray(arr)
+        if arr.size == 0:
+            if n_rows is None:
+                return arr.reshape(0, 0)
+            dtype = object if arr.dtype == object else float
+            return np.empty((int(n_rows), 0), dtype=dtype)
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+
+        if n_rows is None:
+            return arr
+
+        n_rows = int(n_rows)
+        if arr.shape[0] == n_rows:
+            return arr
+
+        if arr.shape[0] == 1 and n_rows > 1:
+            return np.repeat(arr, n_rows, axis=0)
+
+        dtype = object if arr.dtype == object else float
+        out = np.full((n_rows, arr.shape[1]), np.nan, dtype=dtype)
+        n_copy = min(n_rows, arr.shape[0])
+        out[:n_copy, :] = arr[:n_copy, :]
+        return out
+
+    def _objective_values_for_export(self, Y):
+        # print(Y)
+        Y_export = np.asarray(Y, dtype=float).copy()
+        if Y_export.ndim == 1:
+            Y_export = Y_export.reshape(-1, 1)
+        for j, o in enumerate(self.experiment.objectives_spec):
+            if o.get("direction") == "max":
+                Y_export[:, j] = -Y_export[:, j]
+        return Y_export
+
+    def _write_operator_csvs(self, iteration, pf_idx=None):
+        try:
+            out_dir = _get_outputs_dir(self.config)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            X = self._as_2d(self.experiment.input_repository)
+            n_rows = X.shape[0]
+            Y = self._objective_values_for_export(self.experiment.output_repository)
+            E = self._as_2d(self.experiment.error_repository, n_rows=n_rows)
+            C = self._as_2d(getattr(self.experiment, "constraint_values_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            V = self._as_2d(getattr(self.experiment, "constraint_violations_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            CV = self._as_2d(getattr(self.experiment, "constraint_repository", np.zeros((n_rows,))), n_rows=n_rows)
+            Praw = self._as_2d(getattr(self.experiment, "penalty_raw_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            Pval = self._as_2d(getattr(self.experiment, "penalty_value_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            Ptot = self._as_2d(getattr(self.experiment, "penalty_total_repository", np.zeros((n_rows,))), n_rows=n_rows)
+            raw_repo = self._as_2d(getattr(self.experiment, "raw_repository", np.zeros((n_rows, 0))), n_rows=n_rows)
+            it = self._as_2d(getattr(self.experiment, "iteration_repository", np.zeros((n_rows,0))), n_rows=n_rows).astype(int)
+            feasible = (CV.reshape(-1) <= 1e-12).astype(int).reshape(-1, 1)
+            T = self._as_2d(getattr(self.experiment, "timestamp_repository", np.empty((n_rows,0), dtype=object)), n_rows=n_rows).reshape(-1, 1)
+
+            cols = ["Iteration","Timestamp"]
+            blocks = [it,T.astype(object)]
+
+            input_labels = [str(s.get("name", f"x{j}")) for j, s in enumerate(self.experiment.inputs_spec)]
+            obj_labels = [str(s.get("name", f"y{j}")) for j, s in enumerate(self.experiment.objectives_spec)]
+            err_labels = [f"{name}_error" for name in obj_labels[:E.shape[1]]]
+            con_specs = list(getattr(self.experiment, "constraints_spec", []) or [])
+            pen_specs = list(getattr(self.experiment, "penalties", []) or getattr(self.config, "penalties", []) or [])
+            pen_labels = [f"{c.get("name",f"C{j}")}_penalties" for j, c in enumerate(pen_specs)]
+            con_labels = [str(s.get("name", f"constraint_{j}")) for j, s in enumerate(con_specs[:C.shape[1]])]
+            viol_labels = [f"{name}_violation" for name in con_labels[:V.shape[1]]]
+            # pen_labels = [str(s.get("name", f"penalty_{j}")) for j, s in enumerate(pen_specs[:Praw.shape[1]])]
+            pen_val_labels = [f"{name}_penalty_value" for name in pen_labels[:Pval.shape[1]]]
+            # raw_labels = [f"raw_output_{j}" for j in range(raw_repo.shape[1])]
+
+            # print(obj_labels[:Y.shape[1]])
+            # print(Y)
+
+            if X.shape[1]:
+                blocks.append(X); cols.extend(input_labels[:X.shape[1]])
+            if Y.shape[1]:
+                blocks.append(Y); cols.extend(obj_labels[:Y.shape[1]])
+            if E.shape[1]:
+                blocks.append(E); cols.extend(err_labels)
+            if C.shape[1]:
+                blocks.append(C); cols.extend(con_labels)
+            if V.shape[1]:
+                blocks.append(V); cols.extend(viol_labels)
+            blocks.append(CV); cols.append("Constraint_Violation_Total")
+            blocks.append(feasible); cols.append("Feasible")
+            if Praw.shape[1]:
+                blocks.append(Praw); cols.extend(pen_labels)
+            if Pval.shape[1]:
+                blocks.append(Pval); cols.extend(pen_val_labels)
+            blocks.append(Ptot); cols.append("Penalty_Total")
+            # if raw_repo.shape[1]:
+            #     blocks.append(raw_repo); cols.extend(raw_labels)
+
+            try:
+                all_points_arr = np.hstack(blocks)
+            except ValueError as exc:
+                shape_info = [f"{idx}:{np.asarray(b).shape}" for idx, b in enumerate(blocks)]
+                raise ValueError(f"Failed to assemble operator CSV blocks with shapes {shape_info}") from exc
+            all_points = pd.DataFrame(all_points_arr, columns=cols)
+            all_points.to_csv(out_dir / f"{self.config.save_name}_operator_all_points.csv", index=False)
+
+            if pf_idx is None:
+                _, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+            pf_idx = np.asarray(pf_idx, dtype=int).reshape(-1)
+            pareto_points = all_points.iloc[pf_idx].copy() if pf_idx.size else all_points.iloc[0:0].copy()
+            pareto_points.to_csv(out_dir / f"{self.config.save_name}_operator_current_pareto_front.csv", index=False)
+
+            if len(getattr(self, "HV", [])) > 0:
+                metric_iterations = np.arange(1, len(self.HV) + 1, dtype=int)
+                metrics_df = pd.DataFrame({
+                    "Iteration": metric_iterations,
+                    "Hypervolume": np.asarray(self.HV, dtype=float),
+                    "Generational_Distance": np.asarray(getattr(self, "GD", []), dtype=float),
+                    "Diversity": np.asarray(getattr(self, "diversity", []), dtype=float),
+                    "Spacing": np.asarray(getattr(self, "spacing", []), dtype=float),
+                    "PF_Count": np.asarray(getattr(self, "count", []), dtype=int),
+                    "Runtime_s": np.asarray(getattr(self, "runtime_records", []), dtype=float),
+                })
+                metrics_df.to_csv(out_dir / f"{self.config.save_name}_metrics_history.csv", index=False)
+
+            summary_rows = [{"Iteration": getattr(self.experiment, "iteration_repository", None)}]
+            if len(all_points) > 0:
+                summary_rows.append({
+                    "Total_Sampled_Points": int(len(all_points)),
+                    "Feasible_Points": int((all_points["Feasible"] > 0.5).sum()),
+                    "Pareto_Points": int(len(pareto_points)),
+                })
+            pd.DataFrame(summary_rows).to_csv(out_dir / f"{self.config.save_name}_operator_summary.csv", index=False)
+        except Exception as e:
+            logging.exception(f"Failed to write operator CSVs: {e}")
+            raise
+
     def save_checkpoint(self, iteration, filename):
         """Save optimiser state to a file."""
-        state = {"iteration": iteration,
-            "input_repository": self.input_repository,
-            "output_repository": self.output_repository,
-            "error_repository": self.error_repository,
-            "penalty_raw_repository": self.penalty_raw_repository,
-            "constraint_repository": self.constraint_repository,
-            "constraint_values_repository": self.constraint_values_repository,
-            "constraint_violaiton_repository": self.constraint_violations_repository,
-            "hypervolume": self.HV,
-            "GD": self.GD,
-            "diversity": self.diversity,
-            "Spacing": self.spacing,
-            "count": self.count,
-            "gp_models": self.gp_models, 
-            "runtime": self.runtime_records,
+        state = {"iteration": self.experiment.iteration_repository,
+            "timestamp_repository": self.experiment.timestamp_repository,
+            "input_repository": self.experiment.input_repository,
+            "output_repository": self.experiment.output_repository,
+            "error_repository": self.experiment.error_repository,
+            "penalty_raw_repository": self.experiment.penalty_raw_repository,
+            "constraint_repository": self.experiment.constraint_repository,
+            "constraint_values_repository": self.experiment.constraint_values_repository,
+            "constraint_violations_repository": self.experiment.constraint_violations_repository,
+            "iteration_repository": getattr(self.experiment, "iteration_repository", None),
+            "raw_repository": getattr(self.experiment, "raw_repository", None),
+            "hypervolume": getattr(self, "HV", []),
+            "GD": getattr(self, "GD", []),
+            "diversity": getattr(self, "diversity", []),
+            "Spacing": getattr(self, "spacing", []),
+            "count": getattr(self, "count", []),
+            "gp_models": self.gp_models,
+            "runtime": getattr(self, "runtime_records", []),
             "gp_length_scales_history": getattr(self, "gp_length_scales_history", []),
             "cv_gp_length_scales_history": getattr(self, "cv_gp_length_scales_history", []),
             "config": self.config}
@@ -1070,33 +1255,75 @@ class BatchOptimiser(Optimiser):
 
     def load_checkpoint(self, filename):
         """Load optimiser state from a file."""
+        # print(filename)
         if not os.path.exists(filename):
             logging.info("[Checkpoint] No checkpoint found.")
-            return 0  # start from scratch
-
+            start_iter =0
+            return start_iter  # start from scratch
+        # print(filename)
         with open(filename, "rb") as f:
             state = pickle.load(f)
-        self.input_repository = state["input_repository"]
-        self.output_repository = state["output_repository"]
-        self.constraint_repository = state.get("constraint_repository", None)
-        self.constraint_values_repository = state.get("constraint_values_repository", None)
-        self.constraint_violations_repository = state.get("constraint_violations_repository", None)
-        self.error_repository = state.get("error_repository", None)
-        self.penalty_raw_repository = state.get("penalty_raw_repository",None)
-        if self.constraint_repository is not None:
-            self.experiment.constraint_repository = self.constraint_repository
-        if self.constraint_values_repository is not None:
-            self.experiment.constraint_values_repository = self.constraint_values_repository
-        if self.constraint_violations_repository is not None:
-            self.experiment.constraint_violations_repository = self.constraint_violations_repository
-        self.HyperV = state['hypervolume']
-        self.GD = state['GD']
-        self.Diversity = state['diversity']
-        self.Spacing = state['Spacing']
-        self.Count = state['count']
+        self.experiment.input_repository = state["input_repository"]
+        self.experiment.output_repository = state["output_repository"]
+        self.experiment.constraint_repository = state.get("constraint_repository", None)
+        self.experiment.constraint_values_repository = state.get("constraint_values_repository", None)
+        self.experiment.timestamp_repository = state.get("timestamp_repository", None)
+        self.experiment.constraint_violations_repository = state.get(
+            "constraint_violations_repository",
+            state.get("constraint_violaiton_repository", None)
+        )
+        self.experiment.error_repository = state.get("error_repository", None)
+        self.experiment.penalty_raw_repository = state.get("penalty_raw_repository", None)
+
+
+        if self.experiment.constraint_repository is None and self.experiment.constraint_values_repository is not None:
+            _, self.experiment.constraint_repository, self.experiment.constraint_violations_repository, _, _ = extract_Y_CV_details(
+                raw_outputs=self.experiment.output_repository,
+                con_outputs=self.experiment.constraint_values_repository,
+                objectives_spec=self.experiment.objectives_spec,
+                constraints_spec=self.experiment.constraint_specs,
+                method="GOAL_FUNCTION",
+                penalty_outputs=self.experiment.penalty_raw_repository,
+                penalty_specs=self.experiment.penalties,
+            )
+        self.experiment.iteration_repository = state.get("iteration_repository", getattr(self.experiment, "iteration_repository", None))
+        self.experiment.raw_repository = state.get("raw_repository", getattr(self.experiment, "raw_repository", None))
+        # self.experiment.timestamp_repository = self.timestamp_repository
+
+        if self.experiment.penalty_raw_repository is not None and len(self.experiment.penalties or []) > 0:
+            pen_raw = np.asarray(self.experiment.penalty_raw_repository, dtype=float)
+            if pen_raw.ndim == 1:
+                pen_raw = pen_raw.reshape(-1, len(self.experiment.penalties or []))
+            n_samples = pen_raw.shape[0]
+            n_pen = len(self.experiment.penalties or [])
+            P = np.zeros((n_samples, n_pen), dtype=float)
+            for j, p in enumerate(self.experiment.penalties or []):
+                P[:, j] = region_exponential_penalty(
+                    pen_raw[:, j],
+                    lower=float(p["lower"]),
+                    upper=float(p["upper"]),
+                    scale=float(p.get("scale", 1.0)),
+                    rate=float(p.get("rate", 5.0)),
+                )
+            self.experiment.penalty_value_repository = P
+            self.experiment.penalty_total_repository = np.sum(P, axis=1)
+        else:
+            n_rows = 0 if self.experiment.input_repository is None else len(self.experiment.input_repository)
+            n_pen = len(self.experiment.penalties or [])
+            self.experiment.penalty_value_repository = np.empty((n_rows, n_pen), dtype=float)
+            self.experiment.penalty_total_repository = np.zeros((n_rows,), dtype=float)
+
+        self.experiment.penalty_value_repository = self.experiment.penalty_value_repository
+        self.experiment.penalty_total_repository = self.experiment.penalty_total_repository
+
+        self.HV = state.get('hypervolume', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.GD = state.get('GD', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.diversity = state.get('diversity', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.spacing = state.get('Spacing', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.count = state.get('count', [np.array(np.nan,self.experiment.config.no_of_meas)])
         self.gp_models = state["gp_models"]
         self.config = state["config"]
-        self.runtime_records = state["runtime"]
+        self.runtime_records = state.get("runtime", [np.array(np.nan,self.experiment.config.no_of_meas)])
         self.gp_length_scales_history = state.get("gp_length_scales_history", [])
         self.cv_gp_length_scales_history = state.get("cv_gp_length_scales_history", [])
         logging.info(f"[Checkpoint] Loaded from {filename} at iteration {state['iteration']}")
@@ -1107,19 +1334,8 @@ class BatchOptimiser(Optimiser):
         save_name = self.config.save_name
         if resume:
             try:
-                checkpoint = self.load_checkpoint(str(_get_benchmarks_dir(self.config) / f"{save_name}.pkl"))
-                # pf, pf_idx = compute_pareto_front(self.output_repository)
-                self.experiment.input_repository = self.input_repository
-                self.experiment.output_repository = self.output_repository
-                self.experiment.constraint_repository = self.constraint_repository
-                self.experiment.constraint_values_repository = self.constraint_values_repository
-                self.experiment.constraint_violations_repository = self.constraint_violations_repository
-                self.experiment.error_repository = self.error_repository
-                self.experiment.penalty_raw_repository = self.penalty_raw_repository
-                
+                start_iter = self.load_checkpoint(str(_get_benchmarks_dir(self.config) / f"{save_name}.pkl"))                
 
-                # Optional: truncate history and restart from a specific iteration (0-based) (use restart=True to resume from the last completed iteration).
-                #ri = getattr(self.config, "restart_from_iteration", None)
                 if start_iter>0:
                     print('Restarting from iteration')
                     try:
@@ -1128,74 +1344,83 @@ class BatchOptimiser(Optimiser):
                             start_iter = 0
                         n_init = int(getattr(self.config, "no_of_meas", 0) or 0)
                         bs = int(getattr(self.config, "batch_size", 1) or 1)
-                        n_keep = n_init + start_iter * bs
-                        n_keep = min(n_keep, self.input_repository.shape[0])
-
-                        self.input_repository = self.input_repository[:n_keep]
-                        self.output_repository = self.output_repository[:n_keep]
-                        if self.constraint_repository is not None:
-                            self.constraint_repository = np.asarray(self.constraint_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
-                        if self.constraint_values_repository is not None:
-                            self.constraint_values_repository = np.asarray(self.constraint_values_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
-                        if self.constraint_violations_repository is not None:
-                            self.constraint_violations_repository = np.asarray(self.constraint_violations_repository)[:n_keep]#.reshape(-1, len(self.experiment.constraint_specs))
-                        if self.error_repository is not None:
-                            self.error_repository = np.asarray(self.error_repository)[:n_keep]
-                        if self.penalty_raw_repository is not None:
-                            self.penatly_repository = np.asarray(self.penalty_raw_repository)[:n_keep]
-
-                        self.experiment.input_repository = self.input_repository
-                        self.experiment.output_repository = self.output_repository
-                        self.experiment.constraint_repository = self.constraint_repository
-                        self.experiment.constraint_values_repository = self.constraint_values_repository
-                        self.experiment.constraint_violations_repository = self.constraint_violations_repository
-                        self.experiment.error_repository = self.error_repository
-                        self.experiment.penalty_raw_repository = np.vstack([self.penalty_raw_repository, penalty_outputs_new])
-                        self.experiment.penalty_value_repository = np.vstack([self.penalty_value_repository, P_new])
-                        self.experiment.penalty_total_repository = np.hstack([self.penalty_total_repository, total_penalty_new])
+                        # n_keep = n_init + start_iter * bs
+                        # n_keep = min(n_keep, self.input_repository.shape[0])
+                        iter_repo = np.asarray(self.experiment.iteration_repository)
+                        # print(iter_repo)
+                        keep_mask = iter_repo < start_iter
+                        # print(keep_mask)
+                        # print(self.experiment.input_repository)
+                        self.experiment.input_repository = np.asarray(self.experiment.input_repository[keep_mask])
+                        # self.experiment.input_repository = self.experiment.input_repository
+                        # print(self.experiment.input_repository)
+                        self.experiment.output_repository = np.asarray(self.experiment.output_repository[keep_mask])
+                        # print(self.experiment.output_repository)
+                        if self.experiment.constraint_repository is not None:
+                            self.experiment.constraint_repository = np.asarray(self.experiment.constraint_repository[keep_mask])
+                        if self.experiment.constraint_values_repository is not None:
+                            self.experiment.constraint_values_repository = np.asarray(self.experiment.constraint_values_repository[keep_mask])
+                        if self.experiment.constraint_violations_repository is not None:
+                            self.experiment.constraint_violations_repository = np.asarray(self.experiment.constraint_violations_repository[keep_mask])
+                        if self.experiment.error_repository is not None:
+                            self.experiment.error_repository = np.asarray(self.experiment.error_repository[keep_mask])
+                        if self.experiment.penalty_raw_repository is not None:
+                            self.experiment.penalty_raw_repository = np.asarray(self.experiment.penalty_raw_repository[keep_mask])
+                        if self.experiment.penalty_value_repository is not None:
+                            self.experiment.penalty_value_repository = np.asarray(self.experiment.penalty_value_repository[keep_mask])
+                        if self.experiment.penalty_total_repository is not None:
+                            self.experiment.penalty_total_repository = np.asarray(self.experiment.penalty_total_repository[keep_mask])
+                        if getattr(self.experiment, "timestamp_repository", None) is not None:
+                            self.experiment.timestamp_repository = np.asarray(self.experiment.timestamp_repository, dtype=object)[keep_mask]
+                            # self.experiment.timestamp_repository = self.timestamp_repository
+                        # print(self.experiment.timestamp_repository)
+                        self.experiment.iteration_repository = iter_repo[keep_mask]
 
                         # metrics history (if present)
-                        if isinstance(getattr(self, "HyperV", None), list):
-                            self.HyperV = self.HyperV[:start_iter]
-                        if isinstance(getattr(self, "GD", None), list):
-                            self.GD = self.GD[:start_iter]
-                        if isinstance(getattr(self, "Diversity", None), list):
-                            self.Diversity = self.Diversity[:start_iter]
-                        if isinstance(getattr(self, "Spacing", None), list):
-                            self.Spacing = self.Spacing[:start_iter]
-                        if isinstance(getattr(self, "Count", None), list):
-                            self.Count = self.Count[:start_iter]
-                        if isinstance(getattr(self, "runtime_records", None), list):
-                            self.runtime_records = self.runtime_records[:start_iter]
+                        # if isinstance(getattr(self, "HyperV", None), list):
+                        #     self.HyperV = self.HyperV[:start_iter]
+                        # if isinstance(getattr(self, "GD", None), list):
+                        #     self.GD = self.GD[:start_iter]
+                        # if isinstance(getattr(self, "Diversity", None), list):
+                        #     self.Diversity = self.Diversity[:start_iter]
+                        # if isinstance(getattr(self, "Spacing", None), list):
+                        #     self.Spacing = self.Spacing[:start_iter]
+                        # if isinstance(getattr(self, "Count", None), list):
+                        #     self.Count = self.Count[:start_iter]
+                        # if isinstance(getattr(self, "runtime_records", None), list):
+                        #     self.runtime_records = self.runtime_records[:start_iter]
+
+                        self.HV = self.HV[:start_iter]
+                        # print('HV: ',self.HV)
+                        self.GD = self.GD[:start_iter]
+                        self.Diversity = self.Diversity[:start_iter]
+                        self.Spacing = self.Spacing[:start_iter]
+                        self.Count = self.Count[:start_iter]
+                        self.runtime_records = self.runtime_records[:start_iter]
 
                         start_iter = start_iter
-                        logging.info(f"[Restart] Truncated state to iteration {start_iter} (rows kept: {n_keep}).")
+                        logging.info(f"[Restart] Truncated state to iteration {start_iter} (rows kept: {keep_mask}).")
                     except Exception as e:
                         logging.warning(f"[Restart] Could not apply restart_from_iteration={start_iter}: {e}")
-                pf, pf_idx = compute_pareto_front_constrained(self.output_repository, self.experiment.constraint_repository)
-                pf_input = self.input_repository[pf_idx]
-                HyperV = self.HyperV
+                pf, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+                pf_input = self.experiment.input_repository[pf_idx]
+                HV = self.HV
                 GD = self.GD
                 Diversity = self.Diversity
                 Spacing = self.Spacing
                 Count = self.Count
                 runtime_records = self.runtime_records
             except:
-                print('No checkpoint file located - starting from scratch')
-                HyperV = []
-                GD = []
-                Diversity = []
-                Spacing = []
-                Count = []
-                runtime_records = []
-                self.HV = []
-                self.GD = []
-                self.Diversity = []
-                self.Spacing = []
-                self.Count = []
-                self.runtime_records = []
+                print('Starting')
+                HV = self.HV
+                GD = self.GD
+                Diversity = self.Diversity
+                Spacing = self.Spacing
+                Count = self.Count
+                runtime_records = self.runtime_records
+                # start_iter=0
         else:
-            HyperV = []
+            HV = []
             GD = []
             Diversity = []
             Spacing = []
@@ -1207,11 +1432,11 @@ class BatchOptimiser(Optimiser):
             self.Spacing = []
             self.Count = []
             self.runtime_records = []
+            start_iter =0
 
-        for i in range(start_iter, self.iterations):
+        for i in range(start_iter, self.experiment.config.iterations):
             start = time.perf_counter()
-            iter_col = np.full(self.input_repository.shape[0], i+1, dtype=int)
-            self.experiment.iteration_repository = np.hstack([self.experiment.iteration_repository, i])
+            iter_col = np.full(self.experiment.input_repository.shape[0], i+1, dtype=int)
             
             acq = AcquisitionFactory.create(self.aq, beta=self.config.nu, weights=self.weight, reference_point=self.experiment.reference_point, n_samples=5000)
 
@@ -1220,36 +1445,36 @@ class BatchOptimiser(Optimiser):
             default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
             
             for j, gp in enumerate(self.gp_models):
-                y = self.output_repository[:, j]
+                y = self.experiment.output_repository[:, j]
 
-                if hasattr(self, "error_repository") and self.error_repository.shape[0] == len(y):
+                if hasattr(self, "error_repository") and self.experiment.error_repository.shape[0] == len(y):
                     # print(self.error_repository)
-                    error = self.error_repository[:, j]
+                    error = self.experiment.error_repository[:, j]
                 else:
                     error = np.full_like(y, default_error, dtype=float)
 
                 alpha = np.clip(error**2, 1e-12, np.inf)   # variance, avoid zeros
                 gp.alpha = alpha
-                gp.fit(self.input_repository, y) # Fit the GP models to the available data
+                gp.fit(self.experiment.input_repository, y) # Fit the GP models to the available data
 
             cv_gp = None
             try:
                 alpha = float(getattr(self.experiment.config, "constraint_penalty_alpha", 0.0) or 0.0)
                 if getattr(self.experiment, "constraints_spec", None):
                     CV_train = np.asarray(self.experiment.constraint_repository, dtype=float).reshape(-1)
-                    if CV_train.size == self.input_repository.shape[0]:
+                    if CV_train.size == self.experiment.input_repository.shape[0]:
                         cv_gp = GaussianProcessRegressor(
                             kernel=Matern(nu=2.5),
                             alpha=1e-6,
                             normalize_y=True
                         )
-                        cv_gp.fit(self.input_repository, CV_train)
+                        cv_gp.fit(self.experiment.input_repository, CV_train)
             except Exception as e:
                 logging.warning(f"Could not fit CV GP for penalised acquisition: {e}")
 
 
             try:
-                n_dim = int(self.input_repository.shape[1])
+                n_dim = int(self.experiment.input_repository.shape[1])
                 n_obj = int(len(self.gp_models))
                 ls_mat = np.full((n_obj, n_dim), np.nan, dtype=float)
                 for jj, gp in enumerate(self.gp_models):
@@ -1276,7 +1501,7 @@ class BatchOptimiser(Optimiser):
 
             
             # Select batch of candidates and evaluate
-            X_new = filter_previously_sampled(self.experiment.input_repository, self.input_repository, tol=1e-6)
+            X_new = filter_previously_sampled(self.experiment.input_repository, self.experiment.input_repository, tol=1e-6)
             X_new, UCB_values = acq.select_candidates(
                 gp_models=self.gp_models,
                 pareto_front=self.experiment.best_pareto_front,
@@ -1298,6 +1523,18 @@ class BatchOptimiser(Optimiser):
                     logging.warning(f'Acquisition plotting failed: {e}')
 
             raw_new, error_new, con_new, pen_raw_new = self.experiment.evaluator.evaluate_batch(X_new)
+            n_new = raw_new.shape[0]
+            new_iters = np.full(n_new, i, dtype=int)
+            self.experiment.iteration_repository = np.hstack([
+                self.experiment.iteration_repository,
+                new_iters
+            ])
+            new_timestamp = datetime.now().isoformat(timespec="seconds")
+            new_timestamps = np.array([new_timestamp] * n_new, dtype=object)
+            self.experiment.timestamp_repository = np.hstack([
+                self.experiment.timestamp_repository,
+                new_timestamps
+            ])
             # Y_new, CV_new, C_new, V_new, Y_phys_new, Y_pen_new = extract_Y_CV_details(raw_new, con_new, objectives_spec=self.experiment.objectives_spec, constraints_spec=self.experiment.constraints_spec, method=self.experiment.config.evaluation_method, penalty_specs=self.experiment.config.penalties)
             Y_pen_new, CV_new, C_new, V_new, Y_phys_new, penalty_outputs_new, P_new, total_penalty_new = extract_Y_CV_details(
                     raw_new, con_new,
@@ -1312,19 +1549,49 @@ class BatchOptimiser(Optimiser):
 
             
             # Add to repositories
-            self.experiment.input_repository = np.vstack([self.input_repository, X_new])
+            self.experiment.input_repository = np.vstack([self.experiment.input_repository, X_new])
             Y_new = Y_phys_new.copy()
             for j, o in enumerate(self.experiment.objectives_spec):
                 if o["direction"] == "max":
                     Y_new[:,j]=-Y_new[:,j]
-            self.experiment.output_repository = np.vstack([self.output_repository, Y_new])
-            self.experiment.constraint_repository = np.hstack([self.constraint_repository, CV_new])
-            self.experiment.constraint_values_repository = np.vstack([self.constraint_values_repository, C_new])
-            self.experiment.constraint_violations_repository = np.vstack([self.constraint_violations_repository, V_new])
-            self.experiment.error_repository = np.vstack([self.error_repository,error_new])
-            self.experiment.penalty_raw_repository = np.vstack([self.experiment.penalty_raw_repository,penalty_outputs_new])
-            self.experiment.penalty_value_repository = np.vstack([self.experiment.penalty_value_repository, P_new])
-            self.experiment.penalty_total_repository = np.hstack([self.experiment.penalty_total_repository, total_penalty_new])
+            self.experiment.output_repository = np.vstack([self.experiment.output_repository, Y_new])
+            self.experiment.constraint_repository = np.hstack([self.experiment.constraint_repository, CV_new])
+            self.experiment.constraint_values_repository = np.vstack([self.experiment.constraint_values_repository, C_new])
+            self.experiment.constraint_violations_repository = np.vstack([self.experiment.constraint_violations_repository, V_new])
+            self.experiment.error_repository = np.vstack([self.experiment.error_repository,error_new])
+            penalty_outputs_new = np.asarray(penalty_outputs_new, dtype=float)
+            P_new = np.asarray(P_new, dtype=float)
+            total_penalty_new = np.asarray(total_penalty_new, dtype=float).reshape(-1)
+
+            if penalty_outputs_new.ndim == 1:
+                n_pen_new = len(self.experiment.penalties or []) if len(self.experiment.penalties or []) > 0 else 1
+                penalty_outputs_new = penalty_outputs_new.reshape(-1, n_pen_new)
+            if P_new.ndim == 1:
+                n_pen_new = penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 and penalty_outputs_new.size > 0 else (len(self.experiment.penalties or []) if len(self.experiment.penalties or []) > 0 else 1)
+                P_new = P_new.reshape(-1, n_pen_new)
+
+            prev_pen_raw = np.asarray(getattr(self.experiment, "penalty_raw_repository", np.empty((0, 0))), dtype=float)
+            prev_pen_val = np.asarray(getattr(self.experiment, "penalty_value_repository", np.empty((0, 0))), dtype=float)
+            prev_pen_tot = np.asarray(getattr(self.experiment, "penalty_total_repository", np.empty((0,))), dtype=float).reshape(-1)
+
+            if prev_pen_raw.size == 0:
+                prev_pen_raw = np.empty((0, penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 else 0), dtype=float)
+            elif prev_pen_raw.ndim == 1:
+                prev_pen_raw = prev_pen_raw.reshape(-1, penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 and penalty_outputs_new.size > 0 else 1)
+
+            if prev_pen_val.size == 0:
+                prev_pen_val = np.empty((0, P_new.shape[1] if P_new.ndim == 2 else 0), dtype=float)
+            elif prev_pen_val.ndim == 1:
+                prev_pen_val = prev_pen_val.reshape(-1, P_new.shape[1] if P_new.ndim == 2 and P_new.size > 0 else 1)
+
+            if prev_pen_raw.shape[1] == 0 and penalty_outputs_new.ndim == 2 and penalty_outputs_new.shape[1] > 0:
+                prev_pen_raw = np.empty((prev_pen_raw.shape[0], penalty_outputs_new.shape[1]), dtype=float)
+            if prev_pen_val.shape[1] == 0 and P_new.ndim == 2 and P_new.shape[1] > 0:
+                prev_pen_val = np.empty((prev_pen_val.shape[0], P_new.shape[1]), dtype=float)
+
+            self.experiment.penalty_raw_repository = np.vstack([prev_pen_raw, penalty_outputs_new])
+            self.experiment.penalty_value_repository = np.vstack([prev_pen_val, P_new])
+            self.experiment.penalty_total_repository = np.hstack([prev_pen_tot, total_penalty_new])
 
 
             # Append extra repositories (raw outputs + per-constraint info)
@@ -1336,34 +1603,21 @@ class BatchOptimiser(Optimiser):
             except Exception:
                 pass
 
-
-            self.input_repository = self.experiment.input_repository
-            self.output_repository = self.experiment.output_repository
-            self.constraint_repository = self.experiment.constraint_repository
-            self.constraint_values_repository = self.experiment.constraint_values_repository
-            self.constraint_violations_repository = self.experiment.constraint_violations_repository
-            self.constraint_values_repository = self.experiment.constraint_values_repository
-            self.constraint_violations_repository = self.experiment.constraint_violations_repository
-            self.error_repository = self.experiment.error_repository
-
-            self.constraint_values_repository = getattr(self.experiment, "constraint_values_repository", None)
-            self.constraint_violations_repository = getattr(self.experiment, "constraint_violations_repository", None)
-            self.raw_repository = getattr(self.experiment, "raw_repository", None)
-
             elapsed = time.perf_counter() - start
             
 
             # Update metrics and save PF for this iteration
-            pf, pf_idx = compute_pareto_front_constrained(self.output_repository, self.experiment.constraint_repository)
-            pf_input = pd.DataFrame(self.input_repository[pf_idx])
-            pf_samples = pd.DataFrame(self.output_repository[pf_idx])
-            pf_error = self.error_repository[pf_idx]
+            pf, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+            pf_input = pd.DataFrame(self.experiment.input_repository[pf_idx])
+            pf_samples = pd.DataFrame(self.experiment.output_repository[pf_idx])
+            pf_error = self.experiment.error_repository[pf_idx]
             pf_points = pd.concat([pf_input, pf_samples],axis=1)
             input_labels = list([str(o["name"]) for o in self.experiment.inputs_spec])
             output_labels = list([str(o["name"]) for o in self.experiment.objectives_spec])
             total_labels=list(np.concat([input_labels, output_labels]))
             pf_points.columns=total_labels
             pf_points.to_csv('Current_pareto_front.csv')
+            self._write_operator_csvs(iteration=i, pf_idx=pf_idx)
             
             hv = Metrics.hypervolume(pf, self.experiment.reference_point)
             gd = Metrics.generational_distance(pf, self.experiment.best_pareto_front)
@@ -1371,7 +1625,7 @@ class BatchOptimiser(Optimiser):
             spacing = Metrics.spacing(pf)
             count = Metrics.num_pf_points(pf)
             goal_kwargs_json = json.dumps(self.experiment.config.goal_function_kwargs, sort_keys=True, default=str)
-            HyperV.append(hv)
+            HV.append(hv)
             GD.append(gd)
             Diversity.append(div)
             Spacing.append(spacing)
@@ -1379,7 +1633,7 @@ class BatchOptimiser(Optimiser):
             runtime_records.append(elapsed)
             print({"iteration": i, "elapsed_s": elapsed})
 
-            self.HV = HyperV
+            self.HV = HV
             self.GD = GD
             self.diversity = Diversity
             self.spacing = Spacing
@@ -1388,7 +1642,7 @@ class BatchOptimiser(Optimiser):
 
             labels = [o["name"] for o in self.experiment.objectives_spec]
             directions = [o["direction"] for o in self.experiment.objectives_spec]
-            self.plotter.plot_pareto_front_colourmap(Y_init=self.experiment.Y_init,Y=self.output_repository,pf_idx=pf_idx,objective_labels=labels,objective_directions=directions,save_name=self.experiment.config.save_name,CV=self.experiment.constraint_repository)
+            self.plotter.plot_pareto_front_colourmap(Y_init=self.experiment.Y_init,Y=self.experiment.output_repository,pf_idx=pf_idx,objective_labels=labels,objective_directions=directions,save_name=self.experiment.config.save_name,CV=self.experiment.constraint_repository)
             # self.plotter.plot_3obj_pareto_physical_axes(self.output_repository, pf_idx, labels, title=str(self.experiment.config.working_dir)+'/Outputs/3D_initial_PF')
             self.plotter.plot_hypervolume_evolution(self.HV, self.evaluation_method,  str(_get_outputs_dir(self.config)) + "/", i, self.config.save_name)
 
@@ -1402,36 +1656,43 @@ class BatchOptimiser(Optimiser):
         
 
         labels = [o["name"] for o in self.experiment.objectives_spec]
-
-        Samples = np.asarray(self.input_repository)
-        Objectives = np.asarray(self.output_repository)
-        error_values = np.asarray(self.error_repository)
-        C_values = np.asarray(self.constraint_values_repository)
-        V_values = np.asarray(self.constraint_violations_repository)
-        CV_values = np.asarray(self.constraint_repository).reshape(-1, 1)
-        it = np.asarray(self.experiment.iteration_repository).reshape(-1, 1)
-        penalty_raw_values = np.asarray(self.experiment.penalty_raw_repository, dtype=float)
-        penalty_processed_values = np.asarray(self.experiment.penalty_value_repository, dtype=float)
-        penalty_total_values = np.asarray(self.experiment.penalty_total_repository, dtype=float).reshape(-1, 1)
+        # X = self._as_2d(self.experiment.input_repository)
+        # n_rows = X.shape[0]
+        Samples = self._as_2d(self.experiment.input_repository)
+        n_rows = Samples.shape[0]
+        Objectives = self._objective_values_for_export(self.experiment.output_repository)
+        error_values = self._as_2d(self.experiment.error_repository, n_rows=n_rows)
+        C_values = self._as_2d(getattr(self.experiment, "constraint_values_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        V_values = self._as_2d(getattr(self.experiment, "constraint_violations_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        CV_values = self._as_2d(getattr(self.experiment, "constraint_repository", np.zeros((n_rows,))), n_rows=n_rows)
+        penalty_raw_values = self._as_2d(getattr(self.experiment, "penalty_raw_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        penalty_processed_values = self._as_2d(getattr(self.experiment, "penalty_value_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        penalty_total_values = self._as_2d(getattr(self.experiment, "penalty_total_repository", np.zeros((n_rows,))), n_rows=n_rows)
+        # raw_repo = self._as_2d(getattr(self.experiment, "raw_repository", np.zeros((n_rows, 0))), n_rows=n_rows)
+        it = self._as_2d(getattr(self.experiment, "iteration_repository", np.zeros((n_rows,0))), n_rows=n_rows).astype(int)
+        feasible = (CV_values.reshape(-1) <= 1e-12).astype(int).reshape(-1, 1)
+        timestamps = self._as_2d(getattr(self.experiment, "timestamp_repository", np.empty((n_rows,0), dtype=object)), n_rows=n_rows).reshape(-1, 1)
 
         raw_repo = np.hstack([
             it,
+            timestamps,
             Samples,
             Objectives,
             error_values,
             C_values,
             V_values,
             CV_values,
+            feasible,
             penalty_raw_values,
             penalty_processed_values,
             penalty_total_values
         ])
 
         metrics_repo = []
-        for j in range(len(HyperV)):
+        for j in range(len(HV)):
             metrics_repo.append({
-                "Iteration": int(it[len(it) - len(HyperV) + j].reshape(-1)[0]),
-                "Hypervolume": float(HyperV[j]),
+                "Iteration": int(it[len(it) - len(HV) + j].reshape(-1)[0]),
+                "Hypervolume": float(HV[j]),
                 "Generational_Distance": float(GD[j]),
                 "Diversity": float(Diversity[j]),
                 "Spacing": float(Spacing[j]),
@@ -1439,6 +1700,20 @@ class BatchOptimiser(Optimiser):
                 "Runtime": float(runtime_records[j]),
                 "Goal_func_kwargs": goal_kwargs_json,
             })
+
+        try:
+            out_dir = _get_outputs_dir(self.config)
+            for fname in [
+                f"{self.config.save_name}_operator_all_points.csv",
+                f"{self.config.save_name}_operator_current_pareto_front.csv",
+                f"{self.config.save_name}_metrics_history.csv",
+                f"{self.config.save_name}_operator_summary.csv",
+            ]:
+                fpath = out_dir / fname
+                # if fpath.exists():
+                #     fpath.unlink()
+        except Exception:
+            pass
 
         return {"raw_repo": raw_repo,
                 "gp_models": self.gp_models,
@@ -1564,8 +1839,8 @@ class EvaluatorBase:
         self.config = experiment.config
         self.logger = experiment.logger
         self.gp_models = experiment.gp_models
-        self.input_repository = experiment.input_repository
-        self.output_repository = experiment.output_repository
+        self.experiment.input_repository = experiment.input_repository
+        self.experiment.output_repository = experiment.output_repository
 
 class InteractiveEvaluator(EvaluatorBase):
     def __init__(self, inputs, objectives, constraints):
@@ -1842,8 +2117,6 @@ class EvaluatorFactory:
 
             if not goal_path:
                 raise ValueError("GOAL evaluation requires goal_function_path in config")
-
-            ################## Find goal function #################
 
             import importlib
             import importlib.util

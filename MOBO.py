@@ -556,6 +556,14 @@ class MOBOExperiment:
         self.gp_models = None
         self.reference_point = None
         self.best_pareto_front = None
+        self.timestamp_repository=np.empty((0,), dtype=object)
+
+        # self.HV = None
+        # self.GD = None
+        # self.Diversity = None
+        # self.Spacing = None
+        # self.Count = None
+        # self.runtime_records = None
 
     def setup(self):
         self.logger.info("Setting up MOBO experiment")
@@ -674,7 +682,7 @@ class MOBOExperiment:
         # np.savetxt(f"{prefix}_pareto_front.csv", results["pareto_front"], delimiter=",")
         
         df=pd.DataFrame(results['raw_repo'])
-        labels=['iteration']
+        labels=['iteration','timestamp']
         inputs, objs, error_specs, con_val, con_viol= [],[],[],[],[]
         objective_names = [o["name"] for o in self.objectives]
         constraint_names = [o["name"] for o in self.constraints]
@@ -689,12 +697,14 @@ class MOBOExperiment:
         for i in range(len(constraint_names)):
             labels.append('processed_value_'+constraint_names[i])
         labels.append('constraint_value_used')
+        labels.append("feaible_bool")
         penalty_names = [p["name"] for p in self.penalties]
         for name in penalty_names:
             labels.append(f"raw_penalty_{name}")
         for name in penalty_names:
             labels.append(f"processed_penalty_{name}")
         labels.append("total_penalty")
+        
         df.columns=labels
         print(df)
         df.to_csv(f"{prefix}/_raw_repository.csv", header=True)
@@ -768,6 +778,8 @@ class MOBOExperiment:
         metadata["goal_function_kwargs_used"] = self.config.goal_function_kwargs
         metadata["goal_function_path_used"] = str(self.config.goal_function_path)
         metadata["goal_function_name_used"] = str(self.config.goal_function_name)
+        metadata["sample_timestamp_saved"] = True
+        metadata["timestamp_format"] = "ISO 8601, seconds"
 
         meta_path = f"{prefix}/_metadata.json"
         with open(meta_path, "w") as f:
@@ -785,6 +797,7 @@ def save_checkpoint(data, filename):
 
 
 def load_checkpoint(filename):
+    print(filename)
     if Path(filename).exists():
         with open(filename, "rb") as f:
             data = pickle.load(f)
@@ -823,6 +836,19 @@ def benchmark_single_config(cfg, inputs, objectives, constraints, penalties, n_r
 
     best_pf = None
     base_save_name = cfg.save_name
+
+    repo = None
+    pf_repo = None
+    metrics_repo = None
+
+    start_run = progress["completed_runs"]
+
+    if start_run >= n_runs:
+            raise RuntimeError(
+                f"Checkpoint indicates {start_run} completed runs, but n_runs={n_runs}. "
+                f"Nothing left to run. Delete the checkpoint file or set resume=False."
+            )
+
 
     for seed in range(start_run, n_runs):
         cfg.save_name = f"{base_save_name}_run{seed}"
