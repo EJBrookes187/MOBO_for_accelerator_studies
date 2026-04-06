@@ -538,6 +538,7 @@ class InitialSetup():
         self.rng = np.random.default_rng()
 
         X_pool = self.rng.uniform(bounds[:, 0], bounds[:, 1], size=(N_POOL, n_inputs))
+        print('X_pool: ',X_pool)
 
         # Evaluate pool
         aux = None
@@ -1157,7 +1158,7 @@ class BatchOptimiser(Optimiser):
             err_labels = [f"{name}_error" for name in obj_labels[:E.shape[1]]]
             con_specs = list(getattr(self.experiment, "constraints_spec", []) or [])
             pen_specs = list(getattr(self.experiment, "penalties", []) or getattr(self.config, "penalties", []) or [])
-            pen_labels = [f"{c.get("name",f"C{j}")}_penalties" for j, c in enumerate(pen_specs)]
+            pen_labels = [str(c.get("name",f"C{j}_penalties")) for j, c in enumerate(pen_specs[:Praw.shape[1]])]
             con_labels = [str(s.get("name", f"constraint_{j}")) for j, s in enumerate(con_specs[:C.shape[1]])]
             viol_labels = [f"{name}_violation" for name in con_labels[:V.shape[1]]]
             # pen_labels = [str(s.get("name", f"penalty_{j}")) for j, s in enumerate(pen_specs[:Praw.shape[1]])]
@@ -1522,6 +1523,7 @@ class BatchOptimiser(Optimiser):
                 except Exception as e:
                     logging.warning(f'Acquisition plotting failed: {e}')
 
+            print('X_new: ',X_new)
             raw_new, error_new, con_new, pen_raw_new = self.experiment.evaluator.evaluate_batch(X_new)
             n_new = raw_new.shape[0]
             new_iters = np.full(n_new, i, dtype=int)
@@ -1810,6 +1812,8 @@ class BatchGreedyUCB(Acquisition):
             chosen_idx.append(idx)
             acq_working = self._diversity_penalty(acq_penalised, X_candidates, chosen, length_scale)
 
+            acq_working[np.array(chosen_idx, dtype=int)] = np.inf
+
         X_best = X_candidates[np.array(chosen_idx), :]
 
         info = {
@@ -1829,8 +1833,6 @@ class AcquisitionFactory:
             return BatchGreedyUCB(**allowed)
         else:
             raise ValueError(f"Unknown acquisition: {name}")
-        
-
 
 class EvaluatorBase:
     @abstractmethod
@@ -2059,6 +2061,8 @@ class GoalFunctionEvaluator(EvaluatorBase):
 
         n_batch = X.shape[0]
 
+        print(X)
+
         args = [
             (
                 X[i],
@@ -2072,6 +2076,7 @@ class GoalFunctionEvaluator(EvaluatorBase):
             )
             for i in range(n_batch)
         ]
+        print(args)
 
         if self.multiprocess_bool==True:
             with Pool(processes=os.cpu_count()) as pool:
@@ -2079,6 +2084,7 @@ class GoalFunctionEvaluator(EvaluatorBase):
         if self.multiprocess_bool==False:
             results=[]
             for i in range(len(X)):
+                print(args[i])
                 results.append(self._evaluate_single(args[i]))
 
         raw_rows, error_rows, con_rows, pen_rows = zip(*results)
@@ -2093,8 +2099,6 @@ class GoalFunctionEvaluator(EvaluatorBase):
     def evaluate(self, X: np.ndarray):
         raw, error, con, pen = self.evaluate_batch(X)
         return raw, error, con, pen
-    
-
 
 class EvaluatorFactory:
     @staticmethod

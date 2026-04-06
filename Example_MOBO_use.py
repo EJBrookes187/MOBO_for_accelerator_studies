@@ -68,9 +68,9 @@ penalties = [
 repo, pf_repo, metrics_repo = run_mobo(
     inputs=inputs,
     objectives=objectives,
-    # constraints=constraints,
+    constraints=constraints,
     # penalties=penalties,
-    # training_csv_path='/mnt/Windows/Profile/y2326/Documents/BayesOpt/PITZ_MOBO_vs_MOGA/MOBO_test_scripts/Example_initial_samples.csv',
+    # training_csv_path='./Example_initial_samples.csv',
 
     evaluation_method="GOAL_FUNCTION",
     weighting=True,
@@ -81,7 +81,7 @@ repo, pf_repo, metrics_repo = run_mobo(
     batch_size=1,
 
     save_name="mobo_run_test",
-    working_dir="/mnt/Windows/Profile/y2326/Documents/BayesOpt/PITZ_MOBO_vs_MOGA/MOBO_test_scripts/MOBO_test",
+    working_dir="./MOBO_test",
 
     resume=False,
     restart_from_iteration=0,
