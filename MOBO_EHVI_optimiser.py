@@ -1,0 +1,3411 @@
+from abc import ABC, abstractmethod
+import os
+import numpy as np
+from pymoo.indicators.hv import HV
+from scipy.spatial.distance import cdist
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Sequence, Tuple, Optional, List
+import numpy as np
+import pandas as pd
+import logging
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern
+from sklearn.preprocessing import StandardScaler
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+from scipy.stats.qmc import Sobol
+from scipy.stats import norm, multivariate_normal
+import pickle
+from multiprocessing import Pool, cpu_count
+import matplotlib.pyplot as plt
+from scipy.stats import gaussian_kde
+from scipy.stats import qmc
+import time
+import pandas as pd
+import subprocess
+import json
+from datetime import datetime
+
+def _get_working_dir(config):
+    wd = getattr(config, 'working_dir', None) or '.'
+    return Path(wd)
+
+def _get_outputs_dir(config):
+    return _get_working_dir(config) / str(getattr(config, 'outputs_dirname', 'Outputs'))
+
+def _get_benchmarks_dir(config):
+    return _get_working_dir(config) / str(getattr(config, 'benchmarks_dirname', 'Benchmarks'))
+
+def compute_pareto_front_constrained(Y, CV):
+    """
+    Feasibility-based Pareto front.
+    Charge is negative: CV = max(0, Q - Q_threshold)
+    """
+    Y = np.asarray(Y)
+    CV = np.asarray(CV)
+
+    feasible = CV <= 1e-12
+    infeasible = ~feasible
+
+    # Case 1: feasible solutions exist
+    if np.any(feasible):
+        Y_feas = Y[feasible]
+        idx_feas = np.where(feasible)[0]
+
+        nd_local = NonDominatedSorting().do(
+            Y_feas, only_non_dominated_front=True
+        )
+
+        pf_idx = idx_feas[nd_local]
+        return Y[pf_idx], pf_idx
+
+    # Case 2: all infeasible
+    best = np.min(CV)
+    pf_idx = np.where(CV == best)[0]
+    return Y[pf_idx], pf_idx
+
+        
+def replace_inf_with_reference(Y: np.ndarray, reference_point: np.ndarray) -> np.ndarray:
+    """
+    Replace inf, -inf, or NaN values in Y with the reference point.
+    """
+    Y_clean = np.array(Y, copy=True, dtype=float)
+    ref = np.asarray(reference_point).reshape(1, -1)
+
+    # Replace inf/-inf/NaN
+    bad_mask = ~np.isfinite(Y_clean)
+    Y_clean[bad_mask] = np.take(ref.flatten(), np.where(bad_mask)[1])
+
+    # Clamp values above reference
+    too_high_mask = Y_clean > ref
+    Y_clean[too_high_mask] = np.take(ref.flatten(), np.where(too_high_mask)[1])
+
+    return Y_clean
+
+def filter_previously_sampled(
+    X_candidates: np.ndarray,
+    X_existing: np.ndarray,
+    tol: float = 1e-6
+            ) -> np.ndarray:
+    if X_existing is None or len(X_existing) == 0:
+        return X_candidates
+
+    dists = cdist(X_candidates, X_existing)
+    mask = np.all(dists > tol, axis=1)
+    return X_candidates[mask]
+
+def extract_Y_CV(raw_outputs, objectives_spec, constraints_spec, method):
+    method = str(method).upper()
+    raw = np.asarray(raw_outputs, dtype=float)
+    raw = np.atleast_2d(raw)
+
+    n_obj = len(objectives_spec)
+    n_con = len(constraints_spec)
+
+    # strict shape validation to ensure constraints match config
+    if method in ("MANUAL", "GOAL_FUNCTION", "GOAL", "FUNC", "FUNCTION"):
+        expected = int(n_obj + n_con)
+        if raw.shape[1] < expected:
+            raise ValueError(
+                f"Evaluator returned {raw.shape[1]} values per point, but config expects {expected} "
+                f"(n_obj={n_obj}, n_con={n_con}). Ensure the goal function returns objectives + ALL constraints."
+            )
+    else:
+        req = [int(o["index"]) for o in objectives_spec]
+        if n_con:
+            req += [int(c["index"]) for c in constraints_spec]
+        if req:
+            max_idx = int(np.max(req))
+            if raw.shape[1] <= max_idx:
+                raise ValueError(
+                    f"Evaluator returned raw vector length {raw.shape[1]}, but config requests index {max_idx}. "
+                    f"Ensure the evaluator returns all outputs required for objectives/constraints."
+                )
+
+    if method in ("MANUAL", "GOAL_FUNCTION"):
+        # Manual returns [obj..., con...] in entered order
+        Y_phys = raw[:, :n_obj]
+        C = raw[:, n_obj:n_obj+n_con] if n_con else np.empty((raw.shape[0], 0))
+    else:
+        C = np.empty((raw.shape[0], 0))
+
+    # convert max objectives to minimisation
+    Y = Y_phys.copy()
+    for j, o in enumerate(objectives_spec):
+        if o["direction"].lower() == "max":
+            Y[:, j] = -Y[:, j]
+
+    # constraints to scalar CV
+    if not constraints_spec:
+        CV = np.zeros(raw.shape[0], dtype=float)
+    else:
+        CV = np.zeros(raw.shape[0], dtype=float)
+        for j, c in enumerate(constraints_spec):
+            thr = float(c["threshold"])
+            sense = c["sense"].strip()
+            v = C[:, j]
+            if sense == "<=":
+                viol = np.maximum(0.0, v - thr)
+            elif sense == ">=":
+                viol = np.maximum(0.0, thr - v)
+            else:
+                raise ValueError(f"Invalid constraint sense: {sense}")
+
+            scale = c.get("scale", None)
+            if scale is not None and str(scale).strip() != "":
+                scale = float(scale)
+                if np.isfinite(scale) and scale > 0.0:
+                    viol = viol / scale
+
+            CV = np.maximum(CV, viol)
+
+    return Y, CV
+
+
+
+def map_train_to_pool_indices(X_train, X_pool, rtol=1e-10, atol=1e-12):
+    """
+    Returns pool_idx such that X_pool[pool_idx[i]] == X_train[i] (within tolerance).
+    """
+    X_train = np.asarray(X_train, float)
+    X_pool  = np.asarray(X_pool, float)
+
+    pool_idx = np.empty(X_train.shape[0], dtype=int)
+
+    for i, x in enumerate(X_train):
+        # find rows in pool close to this training point
+        matches = np.where(np.all(np.isclose(X_pool, x, rtol=rtol, atol=atol), axis=1))[0]
+        if len(matches) == 0:
+            raise ValueError(f"Training point {i} not found in input_pool (try loosening atol/rtol). x={x}")
+        pool_idx[i] = int(matches[0])  # if duplicates, take first
+
+    return pool_idx
+
+def map_points_to_grid_index(X_points, X_grid):
+    X_points = np.asarray(X_points, float)
+    X_grid = np.asarray(X_grid, float)
+    idx = np.empty(X_points.shape[0], dtype=int)
+    for i, x in enumerate(X_points):
+        idx[i] = int(np.argmin(np.sum((X_grid - x) ** 2, axis=1)))
+    return idx
+
+from itertools import product
+
+def build_discrete_grid(input_specs, order="input0_slowest"):
+    levels = []
+
+    # Build discrete values per dimension
+    for s in input_specs:
+        vmin = float(s["min"])
+        vmax = float(s["max"])
+        step = float(s["step"])
+
+        # Number of steps
+        n = int(np.floor((vmax - vmin) / step + 1e-12)) + 1
+        arr = vmin + step * np.arange(n)
+
+        # Ensure we don't overshoot due to floating point
+        arr = arr[arr <= vmax + 1e-9]
+
+        levels.append(arr)
+
+    # Generate combinations in desired order
+    if order == "input0_slowest":
+        combos = list(product(*levels))
+    elif order == "input0_fastest":
+        combos = list(product(*levels[::-1]))
+        combos = [c[::-1] for c in combos]
+    else:
+        raise ValueError("order must be 'input0_slowest' or 'input0_fastest'")
+
+    X_grid = np.asarray(combos, dtype=float)
+
+    return X_grid, levels
+
+def region_exponential_penalty(values, lower, upper, scale=1.0, rate=5.0):
+    values = np.asarray(values, dtype=float)
+
+    d = np.zeros_like(values)
+
+    below = values < lower
+    above = values > upper
+
+    d[below] = lower - values[below]
+    d[above] = values[above] - upper
+
+    penalty = np.zeros_like(values)
+    mask = d > 0
+
+    penalty[mask] = scale * (np.exp(rate * d[mask]) - 1.0)
+
+    return penalty
+
+
+def extract_Y_CV_details(raw_outputs, con_outputs, objectives_spec, constraints_spec, method, penalty_outputs=None, penalty_specs=None):
+    """Like extract_Y_CV, but also returns per-constraint values and per-constraint violations.
+    """
+    method = str(method).upper()
+    raw = np.asarray(raw_outputs, dtype=float)
+    con = np.asarray(con_outputs, dtype=float)
+    raw = np.atleast_2d(raw)
+    con = np.atleast_2d(con)
+
+    n_obj = len(objectives_spec)
+    n_con = len(constraints_spec)
+    penalty_specs = penalty_specs or []
+    n_samples = raw.shape[0]
+
+    total_penalty = np.zeros(n_samples)
+
+    # strict shape validation to ensure constraints returned match config
+    if method in ("MANUAL", "GOAL_FUNCTION", "GOAL", "FUNC", "FUNCTION"):
+        expected = int(n_obj)
+        if raw.shape[1] < expected:
+            raise ValueError(
+                f"Evaluator returned {raw.shape[1]} values per point, but config expects {expected} "
+                f"(n_obj={n_obj}, n_con={n_con}). Ensure the goal function returns objectives + all constraints."
+            )
+    else:
+        req = [int(o["index"]) for o in objectives_spec]
+        # if n_con:
+        #     req += [int(c["index"]) for c in constraints_spec]
+        if req:
+            max_idx = int(np.max(req))
+            if raw.shape[1] <= max_idx:
+                raise ValueError(
+                    f"Evaluator returned raw vector length {raw.shape[1]}, but config requests index {max_idx}. "
+                    f"Ensure the evaluator returns all outputs required for objectives/constraints."
+                )
+
+    # Manual returns [obj..., con...] in entered order
+    Y_phys = raw # [:, :n_obj]
+    C = con #raw[:, n_obj:n_obj+n_con] if n_con else np.empty((raw.shape[0], 0))
+
+
+    # convert max objectives to minimisation
+    Y = Y_phys.copy()
+    for j, o in enumerate(objectives_spec):
+        if o["direction"].lower() == "max":
+            Y[:, j] = -Y[:, j]
+
+    # constraints to per-constraint violation matrix + scalar CV
+    if not constraints_spec:
+        V = np.zeros((raw.shape[0], 0), dtype=float)
+        CV = np.zeros(raw.shape[0], dtype=float)
+    else:
+        V = np.zeros((raw.shape[0], n_con), dtype=float)
+        for j, c in enumerate(constraints_spec):
+            thr = float(c["threshold"])
+            sense = c["sense"].strip()
+            v = C[:, j]
+
+            if sense == "<=":
+                viol = np.maximum(0.0, v - thr)
+            elif sense == ">=":
+                viol = np.maximum(0.0, thr - v)
+            else:
+                raise ValueError(f"Invalid constraint sense: {sense}")
+
+            scale = c.get("scale", None)
+            if scale is not None and str(scale).strip() != "":
+                scale = float(scale)
+                if np.isfinite(scale) and scale > 0.0:
+                    viol = viol / scale
+
+            V[:, j] = viol
+        CV = np.max(V, axis=1)
+
+    penalty_specs = penalty_specs or []
+    penalty_outputs = np.asarray(penalty_outputs, dtype=float) if penalty_outputs is not None else np.empty((raw.shape[0], 0))
+
+    if penalty_specs:
+        if penalty_outputs.shape[1] != len(penalty_specs):
+            raise ValueError(
+                f"Penalty output width {penalty_outputs.shape[1]} does not match number of penalties {len(penalty_specs)}."
+            )
+        P = np.zeros((raw.shape[0], len(penalty_specs)), dtype=float)
+        for j, p in enumerate(penalty_specs):
+            P[:, j] = region_exponential_penalty(
+                penalty_outputs[:, j],
+                lower=float(p["lower"]),
+                upper=float(p["upper"]),
+                scale=float(p.get("scale", 1.0)),
+                rate=float(p.get("rate", 5.0))
+            )
+        total_penalty = np.sum(P, axis=1)
+    else:
+        P = np.empty((raw.shape[0], 0), dtype=float)
+        total_penalty = np.zeros(raw.shape[0], dtype=float)
+
+    # penalised objectives
+    Y_pen = Y + total_penalty[:, None]
+
+    return Y_pen, CV, C, V, Y_phys, penalty_outputs, P, total_penalty
+
+
+
+@dataclass
+class InitialSetupResult:
+    input_repository: np.ndarray      
+    output_repository: np.ndarray       
+    input_pool: np.ndarray               
+    output_pool: np.ndarray              
+    best_pareto_front: np.ndarray         
+    best_pareto_inputs: np.ndarray
+    init_pareto_front: np.ndarray
+    init_pareto_inputs: np.ndarray
+    gp_models: List[GaussianProcessRegressor]
+    input_scaler: Optional[StandardScaler]
+    output_scaler: Optional[StandardScaler]
+
+class InitialSetup():
+    def __init__(self,
+                 experiment,
+                 csv_path: str,
+                 input_columns: Sequence[str],
+                 all_labels: Sequence[str],
+                 objective_names: Sequence[int],
+                 evaluator,
+                 input_bounds: Optional[Sequence[Tuple[float, float]]] = None,
+                 reference_point: np.ndarray = None,
+                 scale_data: bool = True,
+                 aq='EHVI',
+                 random_seed: int = 0,
+                 gp_alpha: float = 1e-4,
+                 gp_n_restarts: int = 20,
+                 grid_candidate_size: int = 2000,
+                 nu=2.5,
+                 Eve=2.5,
+                 iterations=50):
+        self.csv_path = Path(csv_path)
+        self.input_columns = list(input_columns)
+        self.all_labels = list(all_labels)
+        self.objective_names = list(objective_names)
+        self.evaluator = evaluator     
+        self.input_bounds = input_bounds
+        self.reference_point = np.asarray(reference_point) if reference_point is not None else None
+        self.scale_data = bool(scale_data)
+        self.rng = np.random.default_rng(random_seed)
+        self.gp_alpha = gp_alpha
+        self.gp_n_restarts = gp_n_restarts
+        self.grid_candidate_size = int(grid_candidate_size)
+        self.nu = nu
+        self.Eve = Eve
+        self.experiment = experiment
+        self.config = experiment.config
+        self.plotter = MOBOPlotter()
+
+        # GP length-scale history (saved each iteration for post-analysis)
+        self.gp_length_scales_history = []  # list of (n_obj, n_dim) arrays
+        self.cv_gp_length_scales_history = []  # list of (n_dim,) arrays (or nan)
+        # Provide plotter with output root (working_dir/Outputs)
+        try:
+            self.plotter.base_output_dir = _get_outputs_dir(self.config)
+            self.plotter.config = self.config
+        except Exception:
+            pass
+
+        self.iterations = iterations
+
+        self.input_pool = None
+        self.output_pool = None
+        self.constraint_pool = None
+        self.constraint_value_pool = None
+        self.constraint_violation_pool = None
+        self.penalty_raw_pool = None
+        self.penalty_value_pool = None
+        self.input_scaler = None
+        self.output_scaler = None
+
+    def _validate(self):
+        if self.input_bounds is not None and len(self.input_bounds) != len(self.input_columns):
+            raise ValueError("input_bounds length must match number of input columns")
+
+    def load_and_clean(self) -> None:
+
+        logger = logging.getLogger("InitialSetup")
+        logging.basicConfig(level=logging.INFO)
+        p = Path(self.csv_path) if self.csv_path else None
+
+        if p and p.exists() and p.is_file():
+            df = pd.read_csv(self.csv_path)
+
+            # Get problem dimensions
+            input_cols = self.experiment.input_columns
+            n_inputs = len(input_cols)
+
+            n_obj = len(self.experiment.objectives_spec)
+            n_con = len(self.experiment.constraints_spec)
+            n_pen = len(self.experiment.penalties)
+
+            if n_inputs == 0:
+                raise ValueError(
+                    "No input columns defined. Check [INPUTS]"
+                )
+
+            # CSV can be either:
+            #   1) full historical rows: Input1..N | obj1..M | error1..M | con1..K | pen1..P
+            #   2) input-only rows:      Input1..N
+            # In case (2), evaluate the inputs fresh now.
+
+            if df.shape[1] < n_inputs:
+                raise ValueError(
+                    f"CSV has too few columns to contain inputs: {df.shape[1]} < {n_inputs}"
+                )
+
+            X = df.iloc[:, 0:n_inputs].to_numpy(dtype=float)
+
+            csv_has_full_outputs = df.shape[1] >= (n_inputs + n_obj)
+            print(df.shape[1])
+            print('Columns:',csv_has_full_outputs)
+
+            if csv_has_full_outputs:
+                Y_phys = df.iloc[:, n_inputs:n_inputs + n_obj].to_numpy(dtype=float)
+
+                # error
+                error_start = n_inputs + n_obj
+                error_end = error_start + n_obj
+
+                if df.shape[1] >= error_end:
+                    error = df.iloc[:, error_start:error_end].to_numpy(dtype=float)
+                else:
+                    error = np.full(
+                        (len(df), n_obj),
+                        self.experiment.config.default_objective_error,
+                        dtype=float
+                    )
+
+                # Constraints
+                con_start = error_end
+                con_end = con_start + n_con
+                pen_end = con_end + n_pen
+
+                if n_pen > 0 and df.shape[1] >= pen_end:
+                    pen_raw = df.iloc[:, con_end:pen_end].to_numpy(dtype=float)
+                else:
+                    pen_raw = np.empty((len(df), 0), dtype=float)
+
+                if n_con > 0 and df.shape[1] >= con_end:
+                    C = df.iloc[:, con_start:con_end].to_numpy(dtype=float)
+                else:
+                    C = np.empty((len(df), 0), dtype=float)
+
+                Y_pen, CV, C, V, Y_phys, penalty_raw, penalty_value, penalty_total = extract_Y_CV_details(
+                    raw_outputs=Y_phys,
+                    con_outputs=C,
+                    objectives_spec=self.experiment.objectives_spec,
+                    constraints_spec=self.experiment.constraints_spec,
+                    method=self.experiment.config.evaluation_method,
+                    penalty_outputs=pen_raw,
+                    penalty_specs=self.experiment.config.penalties
+                )
+            else:
+                logger.info(
+                    f"Loaded input-only CSV with {len(X)} rows; evaluating fresh outputs for initialisation."
+                )
+
+                if hasattr(self.evaluator, "evaluate_batch"):
+                    raw_outputs, error_outputs, con_outputs, pen_raw_outputs = self.experiment.evaluator.evaluate_batch(X)
+                else:
+                    results = [self.evaluator.evaluate(x.reshape(1, -1)) for x in X]
+                    raw_outputs = np.vstack([r[0].squeeze() for r in results])
+                    con_outputs = np.vstack([r[2].squeeze() for r in results]) if n_con > 0 else np.empty((len(results), 0), dtype=float)
+                    pen_raw_outputs = np.vstack([r[3].squeeze() for r in results]) if (n_pen > 0 and len(results) > 0 and isinstance(results[0], (tuple, list)) and len(results[0]) > 3) else np.empty((len(results), 0), dtype=float)
+                    error_outputs = None
+                    if len(results) > 0 and isinstance(results[0], (tuple, list)) and len(results[0]) > 1:
+                        error_outputs = np.vstack([np.atleast_1d(r[1]).squeeze() for r in results])
+
+                Y_pen, CV, C, V, Y_phys, penalty_raw, penalty_value, penalty_total = extract_Y_CV_details(
+                    raw_outputs=np.asarray(raw_outputs, dtype=float),
+                    con_outputs=np.asarray(con_outputs, dtype=float) if n_con > 0 else np.empty((len(X), 0), dtype=float),
+                    objectives_spec=self.experiment.objectives_spec,
+                    constraints_spec=self.experiment.constraints_spec,
+                    method=self.experiment.config.evaluation_method,
+                    penalty_outputs=np.asarray(pen_raw_outputs, dtype=float) if n_pen > 0 else np.empty((len(X), 0), dtype=float),
+                    penalty_specs=self.experiment.config.penalties
+                )
+
+                default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+                use_real_error = getattr(self.experiment.config, "use_real_error", True)
+                if use_real_error and 'error_outputs' in locals() and error_outputs is not None:
+                    error = np.asarray(error_outputs, dtype=float)
+                else:
+                    error = np.full((len(X), n_obj), default_error, dtype=float)
+
+            # Final validation
+            if X.shape[1] == 0:
+                raise ValueError(
+                    "CSV loading failed: 0 input features detected."
+                )
+
+            # Store
+            self.raw_pool = np.asarray(Y_phys, dtype=float)
+            self.input_pool = np.asarray(X, dtype=float)
+            self.output_pool = np.asarray(Y_pen, dtype=float)
+            self.constraint_pool = np.asarray(CV, dtype=float)
+            self.constraint_value_pool = np.asarray(C, dtype=float)
+            self.constraint_violation_pool = np.asarray(V, dtype=float)
+            self.error_pool = np.asarray(error, dtype=float)
+            self.penalty_raw_pool = np.asarray(penalty_raw, dtype=float)
+            self.penalty_value_pool = np.asarray(penalty_value, dtype=float)
+            self.penalty_total_pool = np.asarray(penalty_total, dtype=float)
+
+            logger.info(
+                f"Loaded CSV: {len(self.input_pool)} rows, "
+                f"{self.input_pool.shape[1]} inputs, "
+                f"{self.output_pool.shape[1]} objectives, "
+                f"{self.error_pool.shape[1]} stds, "
+                f"{np.shape(self.penalty_raw_pool)[0]} penalties"
+            )
+            
+
+            return
+
+        if self.input_bounds is None:
+            raise ValueError("input_bounds must be provided when not using a CSV file")
+
+        input_cols = self.experiment.input_columns
+        n_inputs = len(input_cols)
+        bounds = np.array(self.input_bounds, dtype=float)
+
+        N_POOL = self.experiment.config.no_of_meas
+        self.rng = np.random.default_rng()
+
+        X_pool = self.rng.uniform(bounds[:, 0], bounds[:, 1], size=(N_POOL, n_inputs))
+        print('X_pool: ',X_pool)
+
+        # Evaluate pool
+        aux = None
+        if hasattr(self.evaluator, "evaluate_batch"):
+            raw_outputs, error_outputs, con_outputs, pen_raw_outputs = self.experiment.evaluator.evaluate_batch(X_pool)
+        else:
+            results = [self.evaluator.evaluate(x.reshape(1, -1)) for x in X_pool]
+            raw_outputs = np.vstack([r[0].squeeze() for r in results])
+            con_outputs = np.vstack([r[2].squeeze() for r in results])
+            pen_raw_outputs = np.empty((len(results), 0), dtype=float)
+            if len(results) > 0 and isinstance(results[0], (tuple, list)) and len(results[0]) > 1:
+                aux = np.vstack([np.atleast_1d(r[1]).squeeze() for r in results])
+
+
+        Y_pen_pool, CV_pool, C_pool, V_pool, Y_phys_pool, penalty_raw_pool, penalty_value_pool, penalty_total_pool = extract_Y_CV_details(
+            raw_outputs,
+            con_outputs,
+            objectives_spec=self.experiment.objectives_spec,
+            constraints_spec=self.experiment.constraints_spec,
+            method=self.experiment.config.evaluation_method,
+            penalty_outputs=pen_raw_outputs,
+            penalty_specs=self.experiment.config.penalties)
+
+        self.raw_pool = np.asarray(raw_outputs, dtype=float)
+        self.experiment.constraint_pool = np.asarray(CV_pool, dtype=float)
+        self.experiment.constraint_values_pool = np.asarray(C_pool, dtype=float)
+        self.experiment.constraint_violations_pool = np.asarray(V_pool, dtype=float)
+        self.penalty_raw_pool = np.asarray(penalty_raw_pool, dtype=float)
+        self.penalty_value_pool = np.asarray(penalty_value_pool, dtype=float)
+        self.penalty_total_pool = np.asarray(penalty_total_pool, dtype=float)
+        self.experiment.penalty_raw_pool = self.penalty_raw_pool
+        self.experiment.penalty_value_pool = self.penalty_value_pool
+
+        # error
+        default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+        use_real_error = getattr(self.experiment.config, "use_real_error", True)
+
+        n_pool = X_pool.shape[0]
+        n_obj = Y_phys_pool.shape[1]
+
+        if use_real_error==False:
+            error_pool = np.full((n_pool, n_obj), default_error, dtype=float)
+        else:
+            error_pool = np.asarray(error_outputs, dtype=float) if 'error_outputs' in locals() and error_outputs is not None else np.full((n_pool, n_obj), default_error, dtype=float)
+
+        if str(self.experiment.config.evaluation_method).upper() == "MANUAL" and use_real_error and aux is not None:
+            aux_arr = np.asarray(aux, dtype=float)
+            aux_arr = np.atleast_2d(aux_arr)
+
+            if aux_arr.shape == (n_pool, n_obj):
+                error_pool = aux_arr
+            elif aux_arr.shape == (n_obj,):
+                error_pool[0, :] = aux_arr
+
+        # Handle inf
+        if self.reference_point is not None:
+            Y_pen_pool = replace_inf_with_reference(Y_pen_pool, self.reference_point)
+
+        # Store
+        self.input_pool = X_pool
+        self.output_pool = np.atleast_2d(Y_pen_pool)
+        self.constraint_pool = np.asarray(CV_pool, dtype=float)
+        self.constraint_value_pool = np.asarray(C_pool, dtype=float)
+        self.constraint_violation_pool = np.asarray(V_pool, dtype=float)
+        self.error_pool = np.asarray(error_pool, dtype=float)
+
+        n_err = self.error_pool.shape[1] if np.ndim(self.error_pool) > 1 else 1
+        n_con = self.constraint_value_pool.shape[1] if np.ndim(self.constraint_value_pool) > 1 else 0
+        n_pen = self.penalty_raw_pool.shape[1] if np.ndim(self.penalty_raw_pool) > 1 else 0
+        
+
+        logger.info(
+            f"Generated pool: {len(self.input_pool)} rows, "
+            f"{self.input_pool.shape[1]} inputs, "
+            f"{self.output_pool.shape[1]} objectives, "
+            f"{n_err} errors, "
+            f"{n_con} constraints, "
+            f"{n_pen} penalties"
+        )
+
+
+    def choose_initial_samples(self, no_of_init_samples: int, ensure_min_distance: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        print('Reference points: ', self.reference_point)
+        logger = logging.getLogger("InitialSetup")
+    
+        n_pool = len(self.input_pool)
+    
+        if no_of_init_samples > n_pool:
+            raise ValueError("no_of_init_samples > number of available pool points")
+    
+        # choose indices
+        chosen_idx = self.rng.choice(n_pool, size=no_of_init_samples, replace=False)
+    
+        if ensure_min_distance is not None and no_of_init_samples > 1:
+            kept = []
+            for idx in chosen_idx:
+                x = self.input_pool[idx]
+                if not kept:
+                    kept.append(idx)
+                else:
+                    dists = np.linalg.norm(self.input_pool[kept] - x, axis=1)
+                    if np.all(dists >= ensure_min_distance):
+                        kept.append(idx)
+                if len(kept) == no_of_init_samples:
+                    break
+    
+            if len(kept) < no_of_init_samples:
+                logger.warning("Could not enforce min distance for all initial samples - returning subset.")
+            chosen_idx = np.array(kept)
+    
+        X0 = self.input_pool[chosen_idx, :]
+
+        Y0 = self.output_pool[chosen_idx, :]
+        CV0 = self.constraint_pool[chosen_idx]
+        C0 = self.constraint_value_pool[chosen_idx]
+        V0 = self.constraint_violation_pool[chosen_idx]
+        PEN0 = self.penalty_raw_pool[chosen_idx]
+        PEN_val = self.penalty_value_pool[chosen_idx]
+        error0=self.error_pool[chosen_idx]
+
+
+        # Store per-constraint values/violations + raw outputs for the chosen initial samples
+        if self.constraint_value_pool is not None:
+            self.constraint_values_init = np.asarray(self.constraint_value_pool)[chosen_idx, :]
+        else:
+            self.constraint_values_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.constraint_violation_pool is not None:
+            self.constraint_violations_init = np.asarray(self.constraint_violation_pool)[chosen_idx, :]
+        else:
+            self.constraint_violations_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.penalty_raw_pool is not None:
+            self.penalty_init = np.asarray(self.penalty_raw_pool)[chosen_idx, :]
+        else:
+            self.penalty_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.penalty_value_pool is not None:
+            self.penalty_value_init = np.asarray(self.penalty_value_pool)[chosen_idx, :]
+        else:
+            self.penalty_value_init = np.empty((len(chosen_idx), 0), dtype=float)
+
+        if self.penalty_total_pool is not None:
+            self.penalty_total_init = np.asarray(self.penalty_total_pool)[chosen_idx]
+        else:
+            self.penalty_total_init = np.zeros(len(chosen_idx), dtype=float)
+
+        if hasattr(self, "raw_pool"):
+            self.raw_init = np.asarray(self.raw_pool)[chosen_idx, :]
+        else:
+            self.raw_init = np.empty((len(chosen_idx), 0), dtype=float)
+        if self.reference_point is not None:
+            Y0 = replace_inf_with_reference(Y0, self.reference_point)
+
+        #print('c0: ',C0)
+
+        return X0, Y0, CV0, error0, C0, V0, PEN0, PEN_val
+
+
+    def clamp_outputs_to_reference(self, Y: np.ndarray, reference: np.ndarray) -> np.ndarray:
+        ref = np.asarray(reference).reshape(1, -1)
+        mask = np.any(Y > ref, axis=1)
+        Y_clamped = Y.copy()
+        Y_clamped[mask, :] = ref
+        return Y_clamped
+
+    def build_gp_models(self, input_dim: int, n_objectives: int) -> List[GaussianProcessRegressor]:
+        if self.input_bounds is not None:
+            ranges = np.array([b[1] - b[0] for b in self.input_bounds])
+            init_ls = (ranges / 4.0).tolist()
+            bounds = [(r / 1e3, r * 1e3) for r in ranges]
+        else:
+            init_ls = [1.0] * input_dim
+            bounds = [(1e-5, 1e5)] * input_dim
+        models = []
+        for _ in range(n_objectives):
+            kernel = Matern(length_scale=init_ls, length_scale_bounds=bounds, nu=self.nu)
+            gpr = GaussianProcessRegressor(kernel=kernel, alpha=self.gp_alpha,
+                                           n_restarts_optimizer=self.gp_n_restarts,
+                                           normalize_y=True)
+            models.append(gpr)
+        return models
+    
+    def _use_config_initial_samples(self):
+        samples = self.experiment.config.initial_samples
+
+        n_obj = len(self.experiment.objectives_spec)
+        n_con = len(self.experiment.constraints_spec)
+        n_pen = len(self.experiment.penalties)
+
+        X = np.asarray([s["X"] for s in samples], dtype=float)
+        Y_phys = np.asarray([s["Y"] for s in samples], dtype=float)
+
+        C = (
+            np.asarray(
+                [s["C"] if s.get("C") is not None else [np.nan] * n_con for s in samples],
+                dtype=float
+            )
+            if n_con > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        error = (
+            np.asarray(
+                [s["error"] if s.get("error") is not None else [self.experiment.config.default_objective_error] * n_obj for s in samples],
+                dtype=float
+            )
+            if n_obj > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        pen_raw = (
+            np.asarray(
+                [s["P"] if s.get("P") is not None else [0.0] * n_pen for s in samples],
+                dtype=float
+            )
+            if n_pen > 0 else np.empty((len(samples), 0), dtype=float)
+        )
+
+        Y_pen, CV, C, V, Y_phys, penalty_raw, penalty_value, penalty_total = extract_Y_CV_details(
+            raw_outputs=Y_phys,
+            con_outputs=C,
+            objectives_spec=self.experiment.objectives_spec,
+            constraints_spec=self.experiment.constraints_spec,
+            method=self.experiment.config.evaluation_method,
+            penalty_outputs=pen_raw,
+            penalty_specs=self.experiment.config.penalties
+        )
+
+        Y = Y_phys.copy()
+        for j, o in enumerate(self.experiment.objectives_spec):
+            if o["direction"] == "max":
+                Y[:, j] = -Y[:, j]
+
+        self.raw_pool = np.asarray(Y_phys, dtype=float)
+        self.input_pool = X
+        self.output_pool = Y_pen
+        self.constraint_pool = CV
+        self.constraint_value_pool = C
+        self.constraint_violation_pool = V
+        self.error_pool = error
+        self.penalty_raw_pool = penalty_raw
+        self.penalty_value_pool = penalty_value
+        self.penalty_total_pool = penalty_total
+
+        return X, Y_pen, CV, error, C, V, penalty_raw, penalty_value
+
+    def run(self, no_of_init_samples: int = 10, ensure_min_distance: Optional[float] = None) -> InitialSetupResult:
+        logger = logging.getLogger("InitialSetup")
+        # self.load_and_clean()
+
+        if self.csv_path and Path(self.csv_path).exists():
+            logger.info(self.csv_path)
+            self.load_and_clean()
+            X_init = self.input_pool
+            Y_init = self.output_pool
+            
+            expected_n_obj = len(self.experiment.objectives_spec)
+
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
+            CV_init = self.constraint_pool
+            C_init = self.constraint_value_pool
+            V_init = self.constraint_violation_pool
+            Pen_init = self.penalty_raw_pool
+            Pen_init_val = self.penalty_value_pool
+            error_init = self.error_pool
+            no_of_init_samples = len(Y_init)
+
+        elif self.experiment.config.initial_samples:
+            # logger.info('config samples')
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init, Pen_init_val = self._use_config_initial_samples()
+            expected_n_obj = len(self.experiment.objectives_spec)
+
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
+            no_of_init_samples = len(Y_init)
+
+        else:
+            logger.info('Initiating samples')
+            self.load_and_clean()
+            X_init, Y_init, CV_init, error_init, C_init, V_init, Pen_init, Pen_init_val = self.choose_initial_samples(no_of_init_samples, ensure_min_distance=ensure_min_distance)
+
+            CV_init = self.constraint_pool
+            C_init = self.constraint_value_pool
+            V_init = self.constraint_violation_pool
+            Pen_init = self.penalty_raw_pool
+            Pen_init_val = self.penalty_value_pool
+            error_init = self.error_pool
+            no_of_init_samples = len(Y_init)
+
+            expected_n_obj = len(self.experiment.objectives_spec)
+            if Y_init.shape[1] != expected_n_obj:
+                raise ValueError(
+                    f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                    f"but config defines {expected_n_obj}"
+                )
+        
+        #print('c_init3: ',C_init)
+        
+        self.experiment.Y_init=Y_init
+
+        pf, pf_idx = compute_pareto_front_constrained(Y_init, CV_init)
+
+        labels = [o["name"] for o in self.experiment.objectives_spec]
+        directions = [o["direction"] for o in self.experiment.objectives_spec]
+
+        self.plotter.plot_pareto_front_colourmap(
+            Y_init=Y_init,
+            Y=Y_init,
+            pf_idx=pf_idx,
+            objective_labels=labels,
+            objective_directions=directions,
+            save_name=self.experiment.config.save_name,
+            CV=CV_init
+        )
+        if Y_init.shape[1] == 3:
+            self.plotter.plot_3obj_pareto_physical_axes(
+                Y_init, pf_idx, self.objective_names,
+                title=str(self.experiment.config.working_dir) + "/Outputs/_3D_initial_PF"
+            )
+
+        self.experiment.raw_repository = np.asarray(getattr(self, "raw_pool", self.output_pool), dtype=float)
+        # Reference point
+        if self.reference_point is None:
+            self.reference_point = np.max(self.output_pool, axis=0) + 1e6
+            logger.info(f"No reference_point supplied; using default {self.reference_point}")
+        Y_init = self.clamp_outputs_to_reference(Y_init, self.reference_point)
+        expected_n_obj = len(self.experiment.objectives_spec)
+
+        if Y_init.shape[1] != expected_n_obj:
+            raise ValueError(
+                f"Mismatch: Y_init has {Y_init.shape[1]} objectives, "
+                f"but config defines {expected_n_obj}"
+            )
+
+        # Scaling
+        if self.scale_data:
+            self.input_scaler = StandardScaler().fit(self.input_pool)
+            self.output_scaler = StandardScaler().fit(self.output_pool)
+            # X_init_scaled = self.input_scaler.transform(X_init)
+            # Y_init_scaled = self.output_scaler.transform(Y_init)
+            logger.info("Input & output scalers fitted from pool (for GPs).")
+        else:
+            self.input_scaler = None
+            self.output_scaler = None
+            # X_init_scaled, Y_init_scaled = X_init, Y_init
+
+        # Build GP objects
+        # print(Y_init.shape[1])
+        gp_models = self.build_gp_models(input_dim=X_init.shape[1], n_objectives=Y_init.shape[1])
+
+        #- error handling (real vs default)-
+        default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+        use_real_error = getattr(self.experiment.config, "use_real_error", True)
+
+        # Guarantee shape (n_init, n_obj)
+        n_init = X_init.shape[0]
+        init_timestamp = datetime.now().isoformat(timespec="seconds")
+        if getattr(self.experiment, "timestamp_repository", None) is None or len(self.experiment.timestamp_repository) == 0:
+            self.experiment.timestamp_repository = np.array([init_timestamp] * n_init, dtype=object)
+
+        self.experiment.iteration_repository = np.zeros(n_init, dtype=int)
+        for i in range(len(self.experiment.iteration_repository)):
+            self.experiment.iteration_repository[i]=-1
+        n_obj = Y_init.shape[1]
+        # print(n_obj)
+        if (not use_real_error) or (error_init is None):
+            error_init = np.full((n_init, n_obj), default_error, dtype=float)
+        else:
+            error_init = np.asarray(error_init, dtype=float)
+            if error_init.shape != (n_init, n_obj):
+                error_init = np.full((n_init, n_obj), default_error, dtype=float)
+        # Store repositories on experiment (so optimiser can fit GPs with alpha=error^2)
+        self.experiment.input_repository = X_init
+        self.experiment.output_repository = Y_init
+        # self.experiment.constraint_repository = np.asarray(CV_init, dtype=float)
+        self.experiment.error_repository = error_init
+
+        # Store full raw outputs + per-constraint values/violations for post-analysis
+        if hasattr(self, "raw_init"):
+            self.experiment.raw_repository = np.asarray(self.raw_init, dtype=float)
+        else:
+            self.experiment.raw_repository = np.asarray(Y_init, dtype=float)
+        self.experiment.constraint_repository = np.asarray(CV_init).reshape(-1)
+        self.experiment.constraint_values_repository = np.asarray(C_init)
+        self.experiment.constraint_violations_repository = np.asarray(V_init)
+        self.experiment.penalty_raw_repository = np.asarray(Pen_init, dtype=float)
+        self.experiment.penalty_value_repository = np.asarray(Pen_init_val, dtype=float)
+        self.experiment.penalty_total_repository = np.asarray(getattr(self, "penalty_total_init", np.zeros(len(X_init))), dtype=float)
+        
+
+        best_pf, best_idx = compute_pareto_front_constrained(self.output_pool, self.constraint_pool)
+        init_pf, init_idx = compute_pareto_front_constrained(Y_init, CV_init)
+
+        return InitialSetupResult(
+            input_repository=X_init,
+            output_repository=Y_init,
+            input_pool=self.input_pool,
+            output_pool=self.output_pool,
+            best_pareto_front=best_pf,
+            best_pareto_inputs=self.input_pool[best_idx],
+            init_pareto_front=init_pf,
+            init_pareto_inputs=X_init[init_idx],
+            gp_models=gp_models,
+            input_scaler=self.input_scaler,
+            output_scaler=self.output_scaler
+        )
+
+class Optimiser(ABC):
+    def __init__(self, experiment):
+        self.experiment = experiment
+        self.adjustable_beta = experiment.config.adjustable_beta
+        self.iterations = experiment.config.iterations
+        self.eve = experiment.config.eve
+        self.aq = experiment.config.aq
+        self.weight = experiment.config.weight
+        self.reference_point = experiment.reference_point
+        self.input_repository = experiment.input_repository
+        self.output_repository = experiment.output_repository
+        self.experiment.output_repository = experiment.output_repository
+        self.error_repository = experiment.error_repository
+        self.penalty_raw_repository = np.empty(0)
+        self.penalty_value_repository = np.empty(0)
+        self.input_bounds = experiment.config.input_bounds
+        self.nu = experiment.config.nu
+        self.gp_models = self._build_gp_models()
+        self.beta = 2.5
+        self.constraint_repository = self.experiment.constraint_repository
+        self.constraint_values_repository = self.experiment.constraint_values_repository
+        self.constraint_violations_repository = self.experiment.constraint_violations_repository
+        self.config = experiment.config
+        self.Y_init=self.experiment.Y_init
+        
+
+
+class BatchOptimiser(Optimiser):
+    def __init__(self, experiment):
+        self.experiment = experiment
+        self.evaluation_method = experiment.config.evaluation_method
+        self.iterations = experiment.config.iterations
+        self.aq = experiment.config.aq
+        self.weight = experiment.config.weight
+        self.reference_point = experiment.reference_point
+        self.input_repository = experiment.input_repository
+        self.output_repository = experiment.output_repository
+        self.experiment.output_repository = experiment.output_repository
+        self.constraint_repository = experiment.constraint_repository
+        self.constraint_values_repository = experiment.constraint_values_repository
+        self.constraint_violations_repository = experiment.constraint_violations_repository
+        self.error_repository = experiment.error_repository
+        self.penalty_value_repository = experiment.penalty_value_repository
+        self.penalty_total_repository = experiment.penalty_total_repository
+        self.multiprocess_bool=experiment.multiprocess_bool
+
+        # Extra repositories for full post-analysis (per-constraint values/violations + raw outputs)
+        self.constraint_values_repository = getattr(experiment, "constraint_values_repository", None)
+        self.constraint_violations_repository = getattr(experiment, "constraint_violations_repository", None)
+        self.raw_repository = getattr(experiment, "raw_repository", None)
+        self.input_bounds = experiment.config.input_bounds
+        self.batch_size = experiment.config.batch_size
+        self.nu = experiment.config.nu
+        self.config = experiment.config
+        self.input_scaler = getattr(experiment, "input_scaler", None)
+        self.output_scaler = getattr(experiment, "output_scaler", None)
+        self.gp_models = self._build_gp_models()
+        self.beta = 2.5
+        self.logger = logging.getLogger("MOBO_outputs")
+        self.plotter = MOBOPlotter()
+        n_pen = len(self.experiment.penalties or [])
+        self.penalty_raw_repository = np.asarray(getattr(experiment, "penalty_raw_repository", np.empty((0, n_pen))), dtype=float)
+        self.penalty_value_repository = np.asarray(getattr(experiment, "penalty_value_repository", np.empty((0, n_pen))), dtype=float)
+        self.penalty_total_repository = np.asarray(getattr(experiment, "penalty_total_repository", np.empty((0,))), dtype=float)
+
+        # GP length-scale history (saved each iteration for post-analysis)
+        self.gp_length_scales_history = []  # list of (n_obj, n_dim) arrays
+        self.cv_gp_length_scales_history = []  # list of (n_dim,) arrays (or nan)
+
+        self.HV = []
+        self.GD = []
+        self.Diversity = []
+        self.Spacing = []
+        self.Count = []
+        self.runtime_records = []
+
+    def _build_gp_models(self):
+        """
+        Build one Gaussian Process model per objective.
+        """
+        n_outputs = self.experiment.output_repository.shape[1]
+        gp_models = []
+
+        # Automatic GP length-scale handling
+        # Hyperparameters (including length_scales) are re-optimised on every gp.fit()
+        X0 = np.asarray(self.input_repository, dtype=float)
+        d = X0.shape[1]
+        ranges = np.ptp(X0, axis=0)
+        ranges = np.where(ranges <= 0.0, 1.0, ranges)
+
+        # Config toggles (defaults to automatic behaviour)
+        auto_ls = bool(getattr(self.experiment.config, "auto_length_scales", True))
+        n_restarts = int(getattr(self.experiment.config, "gp_n_restarts_optimizer", 5))
+        ls_lower = float(getattr(self.experiment.config, "gp_length_scale_lower_factor", 1e-6))
+        ls_upper = float(getattr(self.experiment.config, "gp_length_scale_upper_factor", 10.0))
+        ls_init_factor = float(getattr(self.experiment.config, "gp_length_scale_init_factor", 0.2))
+
+        if auto_ls:
+            initial_length_scales = (ls_init_factor * ranges).tolist()
+            length_scale_bounds_revisited = np.array([(ls_lower * r, ls_upper * r) for r in ranges], dtype=float)
+        else:
+            # Backwards compatible hard-coded defaults (will be truncated/extended to match dimensionality)
+            initial_length_scales = [0.01, 0.01, 0.1, 0.1, 0.1, 0.01]
+            if len(initial_length_scales) != d:
+                if len(initial_length_scales) > d:
+                    initial_length_scales = initial_length_scales[:d]
+                else:
+                    initial_length_scales = (initial_length_scales + [initial_length_scales[-1]] * (d - len(initial_length_scales)))
+            length_scale_bounds_revisited = np.array([(1e-7, 1.0)] * d, dtype=float)
+
+        for i in range(n_outputs):
+            X = np.asarray(self.input_repository, dtype=float)
+            y = np.asarray(self.experiment.output_repository[:, i], dtype=float)
+            if getattr(self, "input_scaler", None) is not None:
+                X = self.input_scaler.transform(X)
+            if getattr(self, "output_scaler", None) is not None:
+                y = self.output_scaler.transform(np.asarray(self.experiment.output_repository, dtype=float))[:, i]
+            mask = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+            X = X[mask]
+            y = y[mask]
+            kernel = Matern(length_scale=initial_length_scales, length_scale_bounds=length_scale_bounds_revisited, nu=self.nu)
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=n_restarts, normalize_y=True)
+            gp.fit(X, y)
+            gp_models.append(gp)
+        return gp_models
+
+    @staticmethod
+    def _extract_length_scales_from_kernel(kernel, n_dim: int):
+        try:
+            if hasattr(kernel, "length_scale"):
+                ls = np.asarray(getattr(kernel, "length_scale"), dtype=float)
+                if ls.ndim == 0:
+                    return np.full(n_dim, float(ls), dtype=float)
+                if ls.size == n_dim:
+                    return ls.reshape(-1)
+                if ls.size == 1:
+                    return np.full(n_dim, float(ls.reshape(-1)[0]), dtype=float)
+                return None
+
+            for child_name in ("k1", "k2", "base_kernel"):
+                if hasattr(kernel, child_name):
+                    child = getattr(kernel, child_name)
+                    out = BatchOptimiser._extract_length_scales_from_kernel(child, n_dim)
+                    if out is not None:
+                        return out
+        except Exception:
+            return None
+        return None
+
+
+    @staticmethod
+    def _as_2d(arr, n_rows=None):
+        arr = np.asarray(arr)
+        if arr.size == 0:
+            if n_rows is None:
+                return arr.reshape(0, 0)
+            dtype = object if arr.dtype == object else float
+            return np.empty((int(n_rows), 0), dtype=dtype)
+
+        if arr.ndim == 0:
+            arr = arr.reshape(1, 1)
+        elif arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+
+        if n_rows is None:
+            return arr
+
+        n_rows = int(n_rows)
+        if arr.shape[0] == n_rows:
+            return arr
+
+        if arr.shape[0] == 1 and n_rows > 1:
+            return np.repeat(arr, n_rows, axis=0)
+
+        dtype = object if arr.dtype == object else float
+        out = np.full((n_rows, arr.shape[1]), np.nan, dtype=dtype)
+        n_copy = min(n_rows, arr.shape[0])
+        out[:n_copy, :] = arr[:n_copy, :]
+        return out
+
+    def _objective_values_for_export(self, Y):
+        # print(Y)
+        Y_export = np.asarray(Y, dtype=float).copy()
+        if Y_export.ndim == 1:
+            Y_export = Y_export.reshape(-1, 1)
+        for j, o in enumerate(self.experiment.objectives_spec):
+            if o.get("direction") == "max":
+                Y_export[:, j] = -Y_export[:, j]
+        return Y_export
+
+    def _write_operator_csvs(self, iteration, pf_idx=None):
+        try:
+            out_dir = _get_outputs_dir(self.config)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            X = self._as_2d(self.experiment.input_repository)
+            n_rows = X.shape[0]
+            Y = self._objective_values_for_export(self.experiment.output_repository)
+            E = self._as_2d(self.experiment.error_repository, n_rows=n_rows)
+            C = self._as_2d(getattr(self.experiment, "constraint_values_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            V = self._as_2d(getattr(self.experiment, "constraint_violations_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            CV = self._as_2d(getattr(self.experiment, "constraint_repository", np.zeros((n_rows,))), n_rows=n_rows)
+            Praw = self._as_2d(getattr(self.experiment, "penalty_raw_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            Pval = self._as_2d(getattr(self.experiment, "penalty_value_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+            Ptot = self._as_2d(getattr(self.experiment, "penalty_total_repository", np.zeros((n_rows,))), n_rows=n_rows)
+            raw_repo = self._as_2d(getattr(self.experiment, "raw_repository", np.zeros((n_rows, 0))), n_rows=n_rows)
+            it = self._as_2d(getattr(self.experiment, "iteration_repository", np.zeros((n_rows,0))), n_rows=n_rows).astype(int)
+            feasible = (CV.reshape(-1) <= 1e-12).astype(int).reshape(-1, 1)
+            T = self._as_2d(getattr(self.experiment, "timestamp_repository", np.empty((n_rows,0), dtype=object)), n_rows=n_rows).reshape(-1, 1)
+
+            cols = ["Iteration","Timestamp"]
+            blocks = [it,T.astype(object)]
+
+            input_labels = [str(s.get("name", f"x{j}")) for j, s in enumerate(self.experiment.inputs_spec)]
+            obj_labels = [str(s.get("name", f"y{j}")) for j, s in enumerate(self.experiment.objectives_spec)]
+            err_labels = [f"{name}_error" for name in obj_labels[:E.shape[1]]]
+            con_specs = list(getattr(self.experiment, "constraints_spec", []) or [])
+            pen_specs = list(getattr(self.experiment, "penalties", []) or getattr(self.config, "penalties", []) or [])
+            pen_labels = [str(c.get("name",f"C{j}_penalties")) for j, c in enumerate(pen_specs[:Praw.shape[1]])]
+            con_labels = [str(s.get("name", f"constraint_{j}")) for j, s in enumerate(con_specs[:C.shape[1]])]
+            viol_labels = [f"{name}_violation" for name in con_labels[:V.shape[1]]]
+            # pen_labels = [str(s.get("name", f"penalty_{j}")) for j, s in enumerate(pen_specs[:Praw.shape[1]])]
+            pen_val_labels = [f"{name}_penalty_value" for name in pen_labels[:Pval.shape[1]]]
+            # raw_labels = [f"raw_output_{j}" for j in range(raw_repo.shape[1])]
+
+            # print(obj_labels[:Y.shape[1]])
+            # print(Y)
+
+            if X.shape[1]:
+                blocks.append(X); cols.extend(input_labels[:X.shape[1]])
+            if Y.shape[1]:
+                blocks.append(Y); cols.extend(obj_labels[:Y.shape[1]])
+            if E.shape[1]:
+                blocks.append(E); cols.extend(err_labels)
+            if C.shape[1]:
+                blocks.append(C); cols.extend(con_labels)
+            if V.shape[1]:
+                blocks.append(V); cols.extend(viol_labels)
+            blocks.append(CV); cols.append("Constraint_Violation_Total")
+            blocks.append(feasible); cols.append("Feasible")
+            if Praw.shape[1]:
+                blocks.append(Praw); cols.extend(pen_labels)
+            if Pval.shape[1]:
+                blocks.append(Pval); cols.extend(pen_val_labels)
+            blocks.append(Ptot); cols.append("Penalty_Total")
+            # if raw_repo.shape[1]:
+            #     blocks.append(raw_repo); cols.extend(raw_labels)
+
+            try:
+                all_points_arr = np.hstack(blocks)
+            except ValueError as exc:
+                shape_info = [f"{idx}:{np.asarray(b).shape}" for idx, b in enumerate(blocks)]
+                raise ValueError(f"Failed to assemble operator CSV blocks with shapes {shape_info}") from exc
+            all_points = pd.DataFrame(all_points_arr, columns=cols)
+            all_points.to_csv(out_dir / f"{self.config.save_name}_operator_all_points.csv", index=False)
+
+            if pf_idx is None:
+                _, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+            pf_idx = np.asarray(pf_idx, dtype=int).reshape(-1)
+            pareto_points = all_points.iloc[pf_idx].copy() if pf_idx.size else all_points.iloc[0:0].copy()
+            pareto_points.to_csv(out_dir / f"{self.config.save_name}_operator_current_pareto_front.csv", index=False)
+
+            if len(getattr(self, "HV", [])) > 0:
+                metric_iterations = np.arange(1, len(self.HV) + 1, dtype=int)
+                metrics_df = pd.DataFrame({
+                    "Iteration": metric_iterations,
+                    "Hypervolume": np.asarray(self.HV, dtype=float),
+                    "Generational_Distance": np.asarray(getattr(self, "GD", []), dtype=float),
+                    "Diversity": np.asarray(getattr(self, "diversity", []), dtype=float),
+                    "Spacing": np.asarray(getattr(self, "spacing", []), dtype=float),
+                    "PF_Count": np.asarray(getattr(self, "count", []), dtype=int),
+                    "Runtime_s": np.asarray(getattr(self, "runtime_records", []), dtype=float),
+                })
+                metrics_df.to_csv(out_dir / f"{self.config.save_name}_metrics_history.csv", index=False)
+
+            summary_rows = [{"Iteration": getattr(self.experiment, "iteration_repository", None)}]
+            if len(all_points) > 0:
+                summary_rows.append({
+                    "Total_Sampled_Points": int(len(all_points)),
+                    "Feasible_Points": int((all_points["Feasible"] > 0.5).sum()),
+                    "Pareto_Points": int(len(pareto_points)),
+                })
+            pd.DataFrame(summary_rows).to_csv(out_dir / f"{self.config.save_name}_operator_summary.csv", index=False)
+        except Exception as e:
+            logging.exception(f"Failed to write operator CSVs: {e}")
+            raise
+
+    def save_checkpoint(self, iteration, filename):
+        """Save optimiser state to a file."""
+        state = {"iteration": self.experiment.iteration_repository,
+            "timestamp_repository": self.experiment.timestamp_repository,
+            "input_repository": self.experiment.input_repository,
+            "output_repository": self.experiment.output_repository,
+            "error_repository": self.experiment.error_repository,
+            "penalty_raw_repository": self.experiment.penalty_raw_repository,
+            "constraint_repository": self.experiment.constraint_repository,
+            "constraint_values_repository": self.experiment.constraint_values_repository,
+            "constraint_violations_repository": self.experiment.constraint_violations_repository,
+            "iteration_repository": getattr(self.experiment, "iteration_repository", None),
+            "raw_repository": getattr(self.experiment, "raw_repository", None),
+            "hypervolume": getattr(self, "HV", []),
+            "GD": getattr(self, "GD", []),
+            "diversity": getattr(self, "diversity", []),
+            "Spacing": getattr(self, "spacing", []),
+            "count": getattr(self, "count", []),
+            "gp_models": self.gp_models,
+            "runtime": getattr(self, "runtime_records", []),
+            "gp_length_scales_history": getattr(self, "gp_length_scales_history", []),
+            "cv_gp_length_scales_history": getattr(self, "cv_gp_length_scales_history", []),
+            "config_dict": dict(getattr(self.config, "__dict__", {}))}
+        with open(filename, "wb") as f:
+            pickle.dump(state, f)
+        logging.info(f"[Checkpoint] Saved at iteration {iteration} -> {filename}")
+
+    def load_checkpoint(self, filename):
+        """Load optimiser state from a file."""
+        # print(filename)
+        if not os.path.exists(filename):
+            logging.info("[Checkpoint] No checkpoint found.")
+            start_iter =0
+            return start_iter  # start from scratch
+        # print(filename)
+        with open(filename, "rb") as f:
+            state = pickle.load(f)
+        self.experiment.input_repository = state["input_repository"]
+        self.experiment.output_repository = state["output_repository"]
+        self.experiment.constraint_repository = state.get("constraint_repository", None)
+        self.experiment.constraint_values_repository = state.get("constraint_values_repository", None)
+        self.experiment.timestamp_repository = state.get("timestamp_repository", None)
+        self.experiment.constraint_violations_repository = state.get(
+            "constraint_violations_repository",
+            state.get("constraint_violaiton_repository", None)
+        )
+        self.experiment.error_repository = state.get("error_repository", None)
+        self.experiment.penalty_raw_repository = state.get("penalty_raw_repository", None)
+
+
+        if self.experiment.constraint_repository is None and self.experiment.constraint_values_repository is not None:
+            _, self.experiment.constraint_repository, self.experiment.constraint_violations_repository, _, _ = extract_Y_CV_details(
+                raw_outputs=self.experiment.output_repository,
+                con_outputs=self.experiment.constraint_values_repository,
+                objectives_spec=self.experiment.objectives_spec,
+                constraints_spec=self.experiment.constraints_spec,
+                method="GOAL_FUNCTION",
+                penalty_outputs=self.experiment.penalty_raw_repository,
+                penalty_specs=self.experiment.penalties,
+            )
+        self.experiment.iteration_repository = state.get("iteration_repository", getattr(self.experiment, "iteration_repository", None))
+        self.experiment.raw_repository = state.get("raw_repository", getattr(self.experiment, "raw_repository", None))
+        # self.experiment.timestamp_repository = self.timestamp_repository
+
+        if self.experiment.penalty_raw_repository is not None and len(self.experiment.penalties or []) > 0:
+            pen_raw = np.asarray(self.experiment.penalty_raw_repository, dtype=float)
+            if pen_raw.ndim == 1:
+                pen_raw = pen_raw.reshape(-1, len(self.experiment.penalties or []))
+            n_samples = pen_raw.shape[0]
+            n_pen = len(self.experiment.penalties or [])
+            P = np.zeros((n_samples, n_pen), dtype=float)
+            for j, p in enumerate(self.experiment.penalties or []):
+                P[:, j] = region_exponential_penalty(
+                    pen_raw[:, j],
+                    lower=float(p["lower"]),
+                    upper=float(p["upper"]),
+                    scale=float(p.get("scale", 1.0)),
+                    rate=float(p.get("rate", 5.0)),
+                )
+            self.experiment.penalty_value_repository = P
+            self.experiment.penalty_total_repository = np.sum(P, axis=1)
+        else:
+            n_rows = 0 if self.experiment.input_repository is None else len(self.experiment.input_repository)
+            n_pen = len(self.experiment.penalties or [])
+            self.experiment.penalty_value_repository = np.empty((n_rows, n_pen), dtype=float)
+            self.experiment.penalty_total_repository = np.zeros((n_rows,), dtype=float)
+
+        self.experiment.penalty_value_repository = self.experiment.penalty_value_repository
+        self.experiment.penalty_total_repository = self.experiment.penalty_total_repository
+
+        self.HV = state.get('hypervolume', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.GD = state.get('GD', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.diversity = state.get('diversity', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.spacing = state.get('Spacing', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.count = state.get('count', [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.gp_models = state["gp_models"]
+        self.config = state["config"]
+        self.runtime_records = state.get("runtime", [np.array(np.nan,self.experiment.config.no_of_meas)])
+        self.gp_length_scales_history = state.get("gp_length_scales_history", [])
+        self.cv_gp_length_scales_history = state.get("cv_gp_length_scales_history", [])
+        logging.info(f"[Checkpoint] Loaded from {filename} at iteration {state['iteration']}")
+        return state["iteration"]
+
+    def run(self, resume=True):
+        start_iter = self.config.restart_from_iteration
+        save_name = self.config.save_name
+        if resume:
+            try:
+                start_iter = self.load_checkpoint(str(_get_benchmarks_dir(self.config) / f"{save_name}.pkl"))                
+
+                if start_iter>0:
+                    print('Restarting from iteration')
+                    try:
+                        start_iter = int(start_iter)
+                        if start_iter < 0:
+                            start_iter = 0
+                        n_init = int(getattr(self.config, "no_of_meas", 0) or 0)
+                        bs = int(getattr(self.config, "batch_size", 1) or 1)
+                        # n_keep = n_init + start_iter * bs
+                        # n_keep = min(n_keep, self.input_repository.shape[0])
+                        iter_repo = np.asarray(self.experiment.iteration_repository)
+                        # print(iter_repo)
+                        keep_mask = iter_repo < start_iter
+                        # print(keep_mask)
+                        # print(self.experiment.input_repository)
+                        self.experiment.input_repository = np.asarray(self.experiment.input_repository[keep_mask])
+                        # self.experiment.input_repository = self.experiment.input_repository
+                        # print(self.experiment.input_repository)
+                        self.experiment.output_repository = np.asarray(self.experiment.output_repository[keep_mask])
+                        # print(self.experiment.output_repository)
+                        if self.experiment.constraint_repository is not None:
+                            self.experiment.constraint_repository = np.asarray(self.experiment.constraint_repository[keep_mask])
+                        if self.experiment.constraint_values_repository is not None:
+                            self.experiment.constraint_values_repository = np.asarray(self.experiment.constraint_values_repository[keep_mask])
+                        if self.experiment.constraint_violations_repository is not None:
+                            self.experiment.constraint_violations_repository = np.asarray(self.experiment.constraint_violations_repository[keep_mask])
+                        if self.experiment.error_repository is not None:
+                            self.experiment.error_repository = np.asarray(self.experiment.error_repository[keep_mask])
+                        if self.experiment.penalty_raw_repository is not None:
+                            self.experiment.penalty_raw_repository = np.asarray(self.experiment.penalty_raw_repository[keep_mask])
+                        if self.experiment.penalty_value_repository is not None:
+                            self.experiment.penalty_value_repository = np.asarray(self.experiment.penalty_value_repository[keep_mask])
+                        if self.experiment.penalty_total_repository is not None:
+                            self.experiment.penalty_total_repository = np.asarray(self.experiment.penalty_total_repository[keep_mask])
+                        if getattr(self.experiment, "timestamp_repository", None) is not None:
+                            self.experiment.timestamp_repository = np.asarray(self.experiment.timestamp_repository, dtype=object)[keep_mask]
+                            # self.experiment.timestamp_repository = self.timestamp_repository
+                        # print(self.experiment.timestamp_repository)
+                        self.experiment.iteration_repository = iter_repo[keep_mask]
+
+                        # metrics history (if present)
+                        # if isinstance(getattr(self, "HyperV", None), list):
+                        #     self.HyperV = self.HyperV[:start_iter]
+                        # if isinstance(getattr(self, "GD", None), list):
+                        #     self.GD = self.GD[:start_iter]
+                        # if isinstance(getattr(self, "Diversity", None), list):
+                        #     self.Diversity = self.Diversity[:start_iter]
+                        # if isinstance(getattr(self, "Spacing", None), list):
+                        #     self.Spacing = self.Spacing[:start_iter]
+                        # if isinstance(getattr(self, "Count", None), list):
+                        #     self.Count = self.Count[:start_iter]
+                        # if isinstance(getattr(self, "runtime_records", None), list):
+                        #     self.runtime_records = self.runtime_records[:start_iter]
+
+                        self.HV = self.HV[:start_iter]
+                        # print('HV: ',self.HV)
+                        self.GD = self.GD[:start_iter]
+                        self.Diversity = self.Diversity[:start_iter]
+                        self.Spacing = self.Spacing[:start_iter]
+                        self.Count = self.Count[:start_iter]
+                        self.runtime_records = self.runtime_records[:start_iter]
+
+                        start_iter = start_iter
+                        logging.info(f"[Restart] Truncated state to iteration {start_iter} (rows kept: {keep_mask}).")
+                    except Exception as e:
+                        logging.warning(f"[Restart] Could not apply restart_from_iteration={start_iter}: {e}")
+                pf, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+                pf_input = self.experiment.input_repository[pf_idx]
+                HV = self.HV
+                GD = self.GD
+                Diversity = self.Diversity
+                Spacing = self.Spacing
+                Count = self.Count
+                runtime_records = self.runtime_records
+            except:
+                print('Starting')
+                HV = self.HV
+                GD = self.GD
+                Diversity = self.Diversity
+                Spacing = self.Spacing
+                Count = self.Count
+                runtime_records = self.runtime_records
+                # start_iter=0
+        else:
+            HV = []
+            GD = []
+            Diversity = []
+            Spacing = []
+            Count = []
+            runtime_records = []
+            self.HV = []
+            self.GD = []
+            self.Diversity = []
+            self.Spacing = []
+            self.Count = []
+            self.runtime_records = []
+            start_iter =0
+
+        for i in range(start_iter, self.experiment.config.iterations):
+            start = time.perf_counter()
+            iter_col = np.full(self.experiment.input_repository.shape[0], i+1, dtype=int)
+            
+            acq = AcquisitionFactory.create(self.aq, beta=self.config.nu, weights=self.weight, reference_point=self.experiment.reference_point, n_samples=5000)
+
+            # Fit Gaussian Processes
+            logging.info(f"Iteration {i} - Fitting GP")
+            default_error = getattr(self.experiment.config, "default_objective_error", 1e-3)
+            
+            X_fit = np.asarray(self.experiment.input_repository, dtype=float)
+            Y_fit = np.asarray(self.experiment.output_repository, dtype=float)
+            if getattr(self, "input_scaler", None) is not None:
+                X_fit = self.input_scaler.transform(X_fit)
+            if getattr(self, "output_scaler", None) is not None:
+                Y_fit = self.output_scaler.transform(Y_fit)
+
+            for j, gp in enumerate(self.gp_models):
+                y = np.asarray(Y_fit[:, j], dtype=float)
+
+                if hasattr(self, "error_repository") and self.experiment.error_repository.shape[0] == len(y):
+                    error = np.asarray(self.experiment.error_repository[:, j], dtype=float)
+                else:
+                    error = np.full_like(y, default_error, dtype=float)
+
+                if getattr(self, "output_scaler", None) is not None and hasattr(self.output_scaler, 'scale_'):
+                    y_scale = float(self.output_scaler.scale_[j]) if float(self.output_scaler.scale_[j]) != 0.0 else 1.0
+                    error = error / y_scale
+
+                mask = np.isfinite(y) & np.all(np.isfinite(X_fit), axis=1)
+                if not np.any(mask):
+                    raise ValueError("All GP training targets are non-finite.")
+                Xj = X_fit[mask]
+                yj = y[mask]
+                ej = error[mask]
+
+                alpha = np.clip(ej**2, 1e-12, np.inf)
+                gp.alpha = alpha
+                gp.fit(Xj, yj) # Fit the GP models to the available data in scaled space
+
+            cv_gp = None
+            try:
+                alpha = float(getattr(self.experiment.config, "constraint_penalty_alpha", 0.0) or 0.0)
+                if getattr(self.experiment, "constraints_spec", None):
+                    CV_train = np.asarray(self.experiment.constraint_repository, dtype=float).reshape(-1)
+                    if CV_train.size == self.experiment.input_repository.shape[0]:
+                        cv_gp = GaussianProcessRegressor(
+                            kernel=Matern(nu=2.5),
+                            alpha=1e-6,
+                            normalize_y=True
+                        )
+                        cv_gp.fit(X_fit[np.isfinite(CV_train) & np.all(np.isfinite(X_fit), axis=1)], CV_train[np.isfinite(CV_train)])
+            except Exception as e:
+                logging.warning(f"Could not fit CV GP for penalised acquisition: {e}")
+
+
+            try:
+                n_dim = int(self.experiment.input_repository.shape[1])
+                n_obj = int(len(self.gp_models))
+                ls_mat = np.full((n_obj, n_dim), np.nan, dtype=float)
+                for jj, gp in enumerate(self.gp_models):
+                    kern = getattr(gp, "kernel_", None)
+                    if kern is None:
+                        kern = getattr(gp, "kernel", None)
+                    ls = self._extract_length_scales_from_kernel(kern, n_dim)
+                    if ls is not None:
+                        ls_mat[jj, :] = ls
+                self.gp_length_scales_history.append(ls_mat)
+
+                if cv_gp is not None:
+                    cv_kern = getattr(cv_gp, "kernel_", None)
+                    if cv_kern is None:
+                        cv_kern = getattr(cv_gp, "kernel", None)
+                    cv_ls = self._extract_length_scales_from_kernel(cv_kern, n_dim)
+                    if cv_ls is None:
+                        cv_ls = np.full(n_dim, np.nan, dtype=float)
+                else:
+                    cv_ls = np.full(n_dim, np.nan, dtype=float)
+                self.cv_gp_length_scales_history.append(np.asarray(cv_ls, dtype=float).reshape(-1))
+            except Exception as e:
+                logging.warning(f"Could not record GP length scales at iteration {i}: {e}")
+
+            
+            # Select batch of candidates and evaluate
+            X_new = filter_previously_sampled(self.experiment.input_repository, self.experiment.input_repository, tol=1e-6)
+            X_new, UCB_values = acq.select_candidates(
+                gp_models=self.gp_models,
+                pareto_front=self.experiment.best_pareto_front,
+                input_bounds=self.input_bounds,
+                X_existing=self.experiment.input_repository,
+                n_candidates=self.batch_size,
+                cv_gp=cv_gp,
+                feasible_tol=getattr(self.experiment.config, 'feasible_tol', 0.0),
+                constraint_penalty_alpha=getattr(self.experiment.config, 'constraint_penalty_alpha', 0.0),
+           
+                weights=(self.weight if bool(getattr(self.experiment.config, 'weighting', False)) else None),
+                reference_point = self.experiment.config.reference_point
+            )
+            # Plot acquisition values for this iteration
+            if getattr(self.experiment.config, 'plot_acquisition', False):
+                try:
+                    info = UCB_values if isinstance(UCB_values, dict) else {'acq_raw': np.asarray(UCB_values)}
+                    self.plotter.plot_acquisition(iteration=i, save_prefix=self.experiment.config.save_name, info=info)
+                except Exception as e:
+                    logging.warning(f'Acquisition plotting failed: {e}')
+
+            print('X_new: ',X_new)
+            raw_new, error_new, con_new, pen_raw_new = self.experiment.evaluator.evaluate_batch(X_new)
+            n_new = raw_new.shape[0]
+            new_iters = np.full(n_new, i, dtype=int)
+            self.experiment.iteration_repository = np.hstack([
+                self.experiment.iteration_repository,
+                new_iters
+            ])
+            new_timestamp = datetime.now().isoformat(timespec="seconds")
+            new_timestamps = np.array([new_timestamp] * n_new, dtype=object)
+            self.experiment.timestamp_repository = np.hstack([
+                self.experiment.timestamp_repository,
+                new_timestamps
+            ])
+            # Y_new, CV_new, C_new, V_new, Y_phys_new, Y_pen_new = extract_Y_CV_details(raw_new, con_new, objectives_spec=self.experiment.objectives_spec, constraints_spec=self.experiment.constraints_spec, method=self.experiment.config.evaluation_method, penalty_specs=self.experiment.config.penalties)
+            Y_pen_new, CV_new, C_new, V_new, Y_phys_new, penalty_outputs_new, P_new, total_penalty_new = extract_Y_CV_details(
+                    raw_new, con_new,
+                    objectives_spec=self.experiment.objectives_spec,
+                    constraints_spec=self.experiment.constraints_spec,
+                    method=self.experiment.config.evaluation_method,
+                    penalty_specs=self.experiment.config.penalties,
+                    penalty_outputs=pen_raw_new
+                )
+
+            labels = [o["name"] for o in self.experiment.objectives_spec]
+
+            
+            # Add to repositories
+            self.experiment.input_repository = np.vstack([self.experiment.input_repository, X_new])
+            Y_new = Y_phys_new.copy()
+            for j, o in enumerate(self.experiment.objectives_spec):
+                if o["direction"] == "max":
+                    Y_new[:,j]=-Y_new[:,j]
+            self.experiment.output_repository = np.vstack([self.experiment.output_repository, Y_new])
+            self.experiment.constraint_repository = np.hstack([self.experiment.constraint_repository, CV_new])
+            self.experiment.constraint_values_repository = np.vstack([self.experiment.constraint_values_repository, C_new])
+            self.experiment.constraint_violations_repository = np.vstack([self.experiment.constraint_violations_repository, V_new])
+            self.experiment.error_repository = np.vstack([self.experiment.error_repository,error_new])
+            penalty_outputs_new = np.asarray(penalty_outputs_new, dtype=float)
+            P_new = np.asarray(P_new, dtype=float)
+            total_penalty_new = np.asarray(total_penalty_new, dtype=float).reshape(-1)
+
+            if penalty_outputs_new.ndim == 1:
+                n_pen_new = len(self.experiment.penalties or []) if len(self.experiment.penalties or []) > 0 else 1
+                penalty_outputs_new = penalty_outputs_new.reshape(-1, n_pen_new)
+            if P_new.ndim == 1:
+                n_pen_new = penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 and penalty_outputs_new.size > 0 else (len(self.experiment.penalties or []) if len(self.experiment.penalties or []) > 0 else 1)
+                P_new = P_new.reshape(-1, n_pen_new)
+
+            prev_pen_raw = np.asarray(getattr(self.experiment, "penalty_raw_repository", np.empty((0, 0))), dtype=float)
+            prev_pen_val = np.asarray(getattr(self.experiment, "penalty_value_repository", np.empty((0, 0))), dtype=float)
+            prev_pen_tot = np.asarray(getattr(self.experiment, "penalty_total_repository", np.empty((0,))), dtype=float).reshape(-1)
+
+            if prev_pen_raw.size == 0:
+                prev_pen_raw = np.empty((0, penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 else 0), dtype=float)
+            elif prev_pen_raw.ndim == 1:
+                prev_pen_raw = prev_pen_raw.reshape(-1, penalty_outputs_new.shape[1] if penalty_outputs_new.ndim == 2 and penalty_outputs_new.size > 0 else 1)
+
+            if prev_pen_val.size == 0:
+                prev_pen_val = np.empty((0, P_new.shape[1] if P_new.ndim == 2 else 0), dtype=float)
+            elif prev_pen_val.ndim == 1:
+                prev_pen_val = prev_pen_val.reshape(-1, P_new.shape[1] if P_new.ndim == 2 and P_new.size > 0 else 1)
+
+            if prev_pen_raw.shape[1] == 0 and penalty_outputs_new.ndim == 2 and penalty_outputs_new.shape[1] > 0:
+                prev_pen_raw = np.empty((prev_pen_raw.shape[0], penalty_outputs_new.shape[1]), dtype=float)
+            if prev_pen_val.shape[1] == 0 and P_new.ndim == 2 and P_new.shape[1] > 0:
+                prev_pen_val = np.empty((prev_pen_val.shape[0], P_new.shape[1]), dtype=float)
+
+            self.experiment.penalty_raw_repository = np.vstack([prev_pen_raw, penalty_outputs_new])
+            self.experiment.penalty_value_repository = np.vstack([prev_pen_val, P_new])
+            self.experiment.penalty_total_repository = np.hstack([prev_pen_tot, total_penalty_new])
+
+
+            # Append extra repositories (raw outputs + per-constraint info)
+            try:
+                if getattr(self.experiment, "raw_repository", None) is None or np.size(getattr(self.experiment, "raw_repository", np.empty((0,0)))) == 0:
+                    self.experiment.raw_repository = np.asarray(raw_new, dtype=float)
+                else:
+                    self.experiment.raw_repository = np.vstack([self.experiment.raw_repository, np.asarray(raw_new, dtype=float)])
+            except Exception:
+                pass
+
+            elapsed = time.perf_counter() - start
+            
+
+            # Update metrics and save PF for this iteration
+            pf, pf_idx = compute_pareto_front_constrained(self.experiment.output_repository, self.experiment.constraint_repository)
+            pf_input = pd.DataFrame(self.experiment.input_repository[pf_idx])
+            pf_samples = pd.DataFrame(self.experiment.output_repository[pf_idx])
+            pf_error = self.experiment.error_repository[pf_idx]
+            pf_points = pd.concat([pf_input, pf_samples],axis=1)
+            input_labels = list([str(o["name"]) for o in self.experiment.inputs_spec])
+            output_labels = list([str(o["name"]) for o in self.experiment.objectives_spec])
+            total_labels=list(np.concat([input_labels, output_labels]))
+            pf_points.columns=total_labels
+            pf_points.to_csv('Current_pareto_front.csv')
+            self._write_operator_csvs(iteration=i, pf_idx=pf_idx)
+            
+            hv = Metrics.hypervolume(pf, self.experiment.reference_point)
+            gd = Metrics.generational_distance(pf, self.experiment.best_pareto_front)
+            div = Metrics.diversity(pf)
+            spacing = Metrics.spacing(pf)
+            count = Metrics.num_pf_points(pf)
+            goal_kwargs_json = json.dumps(self.experiment.config.goal_function_kwargs, sort_keys=True, default=str)
+            HV.append(hv)
+            GD.append(gd)
+            Diversity.append(div)
+            Spacing.append(spacing)
+            Count.append(count)
+            runtime_records.append(elapsed)
+            print({"iteration": i, "elapsed_s": elapsed})
+
+            self.HV = HV
+            self.GD = GD
+            self.diversity = Diversity
+            self.spacing = Spacing
+            self.count = Count
+            self.runtime_records = runtime_records
+
+            labels = [o["name"] for o in self.experiment.objectives_spec]
+            directions = [o["direction"] for o in self.experiment.objectives_spec]
+            self.plotter.plot_pareto_front_colourmap(Y_init=self.experiment.Y_init,Y=self.experiment.output_repository,pf_idx=pf_idx,objective_labels=labels,objective_directions=directions,save_name=self.experiment.config.save_name,CV=self.experiment.constraint_repository)
+            # self.plotter.plot_3obj_pareto_physical_axes(self.output_repository, pf_idx, labels, title=str(self.experiment.config.working_dir)+'/Outputs/3D_initial_PF')
+            self.plotter.plot_hypervolume_evolution(self.HV, self.evaluation_method,  str(_get_outputs_dir(self.config)) + "/", i, self.config.save_name)
+
+            self.logger.info(f"Iter {i}: HV={hv:.3f}, X_new={len(X_new)} new points")
+            try:
+                _get_benchmarks_dir(self.config).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            self.save_checkpoint(i + 1, str(_get_benchmarks_dir(self.config) / f"{save_name}.pkl"))
+
+        
+
+        labels = [o["name"] for o in self.experiment.objectives_spec]
+        # X = self._as_2d(self.experiment.input_repository)
+        # n_rows = X.shape[0]
+        Samples = self._as_2d(self.experiment.input_repository)
+        n_rows = Samples.shape[0]
+        Objectives = self._objective_values_for_export(self.experiment.output_repository)
+        error_values = self._as_2d(self.experiment.error_repository, n_rows=n_rows)
+        C_values = self._as_2d(getattr(self.experiment, "constraint_values_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        V_values = self._as_2d(getattr(self.experiment, "constraint_violations_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        CV_values = self._as_2d(getattr(self.experiment, "constraint_repository", np.zeros((n_rows,))), n_rows=n_rows)
+        penalty_raw_values = self._as_2d(getattr(self.experiment, "penalty_raw_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        penalty_processed_values = self._as_2d(getattr(self.experiment, "penalty_value_repository", np.empty((n_rows, 0))), n_rows=n_rows)
+        penalty_total_values = self._as_2d(getattr(self.experiment, "penalty_total_repository", np.zeros((n_rows,))), n_rows=n_rows)
+        # raw_repo = self._as_2d(getattr(self.experiment, "raw_repository", np.zeros((n_rows, 0))), n_rows=n_rows)
+        it = self._as_2d(getattr(self.experiment, "iteration_repository", np.zeros((n_rows,0))), n_rows=n_rows).astype(int)
+        feasible = (CV_values.reshape(-1) <= 1e-12).astype(int).reshape(-1, 1)
+        timestamps = self._as_2d(getattr(self.experiment, "timestamp_repository", np.empty((n_rows,0), dtype=object)), n_rows=n_rows).reshape(-1, 1)
+
+        raw_repo = np.hstack([
+            it,
+            timestamps,
+            Samples,
+            Objectives,
+            error_values,
+            C_values,
+            V_values,
+            CV_values,
+            feasible,
+            penalty_raw_values,
+            penalty_processed_values,
+            penalty_total_values
+        ])
+
+        metrics_repo = []
+        for j in range(len(HV)):
+            metrics_repo.append({
+                "Iteration": int(it[len(it) - len(HV) + j].reshape(-1)[0]),
+                "Hypervolume": float(HV[j]),
+                "Generational_Distance": float(GD[j]),
+                "Diversity": float(Diversity[j]),
+                "Spacing": float(Spacing[j]),
+                "PF Count": int(Count[j]),
+                "Runtime": float(runtime_records[j]),
+                "Goal_func_kwargs": goal_kwargs_json,
+            })
+
+        try:
+            out_dir = _get_outputs_dir(self.config)
+            for fname in [
+                f"{self.config.save_name}_operator_all_points.csv",
+                f"{self.config.save_name}_operator_current_pareto_front.csv",
+                f"{self.config.save_name}_metrics_history.csv",
+                f"{self.config.save_name}_operator_summary.csv",
+            ]:
+                fpath = out_dir / fname
+                # if fpath.exists():
+                #     fpath.unlink()
+        except Exception:
+            pass
+
+        return {"raw_repo": raw_repo,
+                "gp_models": self.gp_models,
+                "cv_gp_model": getattr(self, "cv_gp_model", None),
+                "metrics_repo": metrics_repo}
+
+class Acquisition(ABC):
+    @abstractmethod
+    def select_candidates(
+        self,
+        gp_models: Sequence[GaussianProcessRegressor],
+        pareto_front: np.ndarray,
+        input_bounds: Sequence[Tuple[float, float]],
+        n_candidates: int = 1
+    ) -> np.ndarray:
+        """Return X_candidates"""
+        pass
+
+class BatchGreedyUCB(Acquisition):
+    """Batch selection by greedy UCB (sequential penalisation), with optional constraint penalty."""
+
+    def __init__(self, beta=2.5, batch_size=5, n_samples=2000, random_seed=0, length_scale=0.1):
+        self.beta = float(beta)
+        self.batch_size = int(batch_size)
+        self.n_samples = int(n_samples)
+        self.rng = np.random.default_rng(random_seed)
+        self.length_scale = float(length_scale)
+
+    @staticmethod
+    def _diversity_penalty(acq_vals, X_candidates, chosen_points, length_scale):
+        """Increase acquisition values near already chosen points (we are minimising)"""
+        if not chosen_points:
+            return acq_vals
+        penalties = np.zeros_like(acq_vals, dtype=float)
+        chosen = np.vstack(chosen_points)
+        for x in chosen:
+            dists = np.linalg.norm(X_candidates - x, axis=1)
+            penalties += np.exp(-0.5 * (dists / length_scale) ** 2)
+        return acq_vals + penalties * float(np.max(acq_vals))
+
+    def select_candidates(self, gp_models, pareto_front, input_bounds, X_existing, n_candidates=None, **kwargs):
+        """Return (X_best, info_dict)
+        """
+        if n_candidates is None:
+            n_candidates = self.batch_size
+
+        n_dim = len(input_bounds)
+        sampler = Sobol(d=n_dim, scramble=True, seed=int(self.rng.integers(1_000_000)))
+        X_candidates = sampler.random(self.n_samples)
+        bounds = np.array(input_bounds, dtype=float)
+        X_candidates = bounds[:, 0] + (bounds[:, 1] - bounds[:, 0]) * X_candidates
+
+        # avoid re-sampling previous points
+        X_candidates = filter_previously_sampled(X_candidates, X_existing, tol=1e-6)
+
+        # Base UCB (minimisation): sum_j (mu_j - beta*sigma_j)
+        means, stds = [], []
+        for gp in gp_models:
+            mu, sigma = gp.predict(X_candidates, return_std=True)
+            means.append(mu)
+            stds.append(sigma)
+        means = np.vstack(means).T
+        stds = np.vstack(stds).T
+        # Optional objective weighting (applied to the acquisition aggregation only).
+        weights = kwargs.get("weights", None)
+        if weights is None:
+            acq_raw = np.sum(means - self.beta * stds, axis=1)
+        else:
+            w = np.asarray(weights, dtype=float).reshape(-1)
+            if w.size != means.shape[1]:
+                raise ValueError(f"weights length {w.size} must match number of objectives {means.shape[1]}.")
+            acq_raw = np.sum((means - self.beta * stds) * w.reshape(1, -1), axis=1)
+
+        # exponential constraint penalty, derived from CV models (consistent across evaluation methods)
+        penalty_factor = np.ones_like(acq_raw, dtype=float)
+        cv_gp = kwargs.get("cv_gp", None)
+        alpha = float(kwargs.get("constraint_penalty_alpha", 0.0) or 0.0)
+        feasible_tol = float(kwargs.get("feasible_tol", 0.0) or 0.0)
+        if (cv_gp is not None) and (alpha > 0.0):
+            cv_mu = np.asarray(cv_gp.predict(X_candidates), dtype=float).reshape(-1)
+            penalty_factor = np.exp(alpha * np.maximum(0.0, cv_mu - feasible_tol))
+
+        acq_penalised = acq_raw * penalty_factor
+
+        # Greedy selection with diversity penalisation
+        length_scale = float(kwargs.get("length_scale", None) or (0.1 * np.mean(bounds[:, 1] - bounds[:, 0])))
+        chosen = []
+        chosen_idx = []
+
+        acq_working = acq_penalised.copy()
+        for _ in range(int(n_candidates)):
+            idx = int(np.argmin(acq_working))
+            chosen.append(X_candidates[idx:idx+1, :])
+            chosen_idx.append(idx)
+            acq_working = self._diversity_penalty(acq_penalised, X_candidates, chosen, length_scale)
+
+            acq_working[np.array(chosen_idx, dtype=int)] = np.inf
+
+        X_best = X_candidates[np.array(chosen_idx), :]
+
+        info = {
+            "X_candidates": X_candidates,
+            "acq_raw": acq_raw,
+            "penalty_factor": penalty_factor,
+            "acq_penalised": acq_penalised,
+        }
+        return X_best, info
+
+class BatchGreedyEHVI(Acquisition):
+    """Batch EHVI via Monte Carlo on a filtered candidate set, with the same constraint penalty structure as BatchGreedyUCB."""
+
+    def __init__(self, beta=1, batch_size=5, n_samples=2048, random_seed=0, length_scale=1,
+                 mc_samples=32, top_k=256, min_candidate_pool=256,reference_point=None):
+        self.beta = float(beta)
+        self.batch_size = int(batch_size)
+        self.n_samples = int(n_samples)
+        self.rng = np.random.default_rng(random_seed)
+        self.length_scale = float(length_scale)
+        self.mc_samples = max(1, int(mc_samples))
+        self.top_k = max(1, int(top_k))
+        self.min_candidate_pool = max(1, int(min_candidate_pool))
+        self.reference_point = reference_point
+
+    @staticmethod
+    def _diversity_penalty(acq_vals, X_candidates, chosen_points, length_scale):
+        if not chosen_points:
+            return acq_vals
+        penalties = np.zeros_like(acq_vals, dtype=float)
+        chosen = np.vstack(chosen_points)
+        for x in chosen:
+            dists = np.linalg.norm(X_candidates - x, axis=1)
+            penalties += np.exp(-0.5 * (dists / length_scale) ** 2)
+        finite = acq_vals[np.isfinite(acq_vals)]
+        scale = float(np.max(finite)) if finite.size else 1.0
+        return acq_vals + penalties * max(scale, 1.0)
+
+    @staticmethod
+    def _clean_pf(pareto_front, reference_point):
+        ref = np.asarray(reference_point, dtype=float).reshape(-1)
+        if pareto_front is None:
+            return np.empty((0, ref.size), dtype=float)
+        pf = np.asarray(pareto_front, dtype=float)
+        if pf.size == 0:
+            return np.empty((0, ref.size), dtype=float)
+        pf = np.atleast_2d(pf)
+        pf = replace_inf_with_reference(pf, ref)
+        pf = pf[np.all(np.isfinite(pf), axis=1)]
+        if pf.size == 0:
+            return np.empty((0, ref.size), dtype=float)
+        pf = pf[np.all(pf < ref.reshape(1, -1), axis=1)]
+        if pf.size == 0:
+            return np.empty((0, ref.size), dtype=float)
+        nd_idx = NonDominatedSorting().do(pf, only_non_dominated_front=True)
+        return pf[np.asarray(nd_idx, dtype=int)]
+
+    def _estimate_ehvi(self, means, stds, pareto_front, reference_point):
+        n_candidates, n_obj = means.shape
+        ref = np.asarray(reference_point, dtype=float).reshape(-1)
+        pf = self._clean_pf(pareto_front, ref)
+
+        hv_metric = HV(ref_point=ref)
+        base_hv = float(hv_metric.do(pf)) if pf.shape[0] > 0 else 0.0
+        ehvi = np.zeros(n_candidates, dtype=float)
+
+        safe_stds = np.maximum(np.asarray(stds, dtype=float), 1e-12)
+        for i in range(n_candidates):
+            samples = self.rng.normal(
+                loc=np.asarray(means[i], dtype=float),
+                scale=safe_stds[i],
+                size=(self.mc_samples, n_obj)
+            )
+            samples = replace_inf_with_reference(samples, ref)
+            improvements = np.zeros(self.mc_samples, dtype=float)
+            for s_idx in range(self.mc_samples):
+                y = samples[s_idx:s_idx+1, :]
+                if np.any(y >= ref.reshape(1, -1)):
+                    improvements[s_idx] = 0.0
+                    continue
+                if pf.shape[0] == 0:
+                    improvements[s_idx] = float(hv_metric.do(y))
+                else:
+                    y_aug = np.vstack([pf, y])
+                    nd_idx = NonDominatedSorting().do(y_aug, only_non_dominated_front=True)
+                    y_aug = y_aug[np.asarray(nd_idx, dtype=int)]
+                    improvements[s_idx] = max(0.0, float(hv_metric.do(y_aug)) - base_hv)
+            ehvi[i] = float(np.mean(improvements))
+        return ehvi
+
+    def select_candidates(self, gp_models, pareto_front, input_bounds, X_existing, n_candidates=None, **kwargs):
+        if n_candidates is None:
+            n_candidates = self.batch_size
+
+        reference_point = kwargs.get("reference_point", None)
+        print(reference_point)
+        if reference_point is None:
+            raise ValueError("EHVI acquisition requires a reference_point.")
+
+        n_dim = len(input_bounds)
+        sampler = Sobol(d=n_dim, scramble=True, seed=int(self.rng.integers(1_000_000)), bits=64)
+        X_candidates = sampler.random(self.n_samples)
+        bounds = np.array(input_bounds, dtype=float)
+        X_candidates = bounds[:, 0] + (bounds[:, 1] - bounds[:, 0]) * X_candidates
+        X_candidates = filter_previously_sampled(X_candidates, X_existing, tol=1e-6)
+        if X_candidates.shape[0] == 0:
+            raise ValueError("No unsampled candidates remain for EHVI selection.")
+
+        input_scaler = kwargs.get("input_scaler", None)
+        if input_scaler is None:
+            X_existing_scaled = X_existing
+            X_candidates_scaled = X_candidates
+            
+        else:
+            X_existing_scaled = _transform_X_if_needed(X_existing, input_scaler)
+            X_candidates_scaled = _transform_X_if_needed(X_candidates, input_scaler)
+
+        means, stds = [], []
+        for gp in gp_models:
+            mu, sigma = gp.predict(X_candidates_scaled, return_std=True)
+            means.append(mu)
+            stds.append(sigma)
+        means = np.vstack(means).T
+        stds = np.vstack(stds).T
+
+        # Cheap pre-screen so EHVI remains practical for arbitrary objective dimension.
+        weights = kwargs.get("weights", None)
+        if weights is None:
+            prescore = np.sum(means - self.beta * stds, axis=1)
+        else:
+            w = np.asarray(weights, dtype=float).reshape(-1)
+            if w.size != means.shape[1]:
+                raise ValueError(f"weights length {w.size} must match number of objectives {means.shape[1]}.")
+            prescore = np.sum((means - self.beta * stds) * w.reshape(1, -1), axis=1)
+
+        n_pool = X_candidates.shape[0]
+        top_k = min(n_pool, max(int(n_candidates) * 25, self.min_candidate_pool, self.top_k))
+        shortlist_idx = np.argsort(prescore)[:top_k]
+
+        ehvi_vals = self._estimate_ehvi(
+            means=means[shortlist_idx],
+            stds=stds[shortlist_idx],
+            pareto_front=pareto_front,
+            reference_point=reference_point,
+        )
+
+        eps = 1e-16
+        acq_raw = np.full(n_pool, np.inf, dtype=float)
+        acq_raw[shortlist_idx] = 1.0 / (ehvi_vals + eps)
+
+        penalty_factor = np.ones_like(acq_raw, dtype=float)
+        cv_gp = kwargs.get("cv_gp", None)
+        alpha = float(kwargs.get("constraint_penalty_alpha", 0.0) or 0.0)
+        feasible_tol = float(kwargs.get("feasible_tol", 0.0) or 0.0)
+        if (cv_gp is not None) and (alpha > 0.0):
+            cv_mu = np.asarray(cv_gp.predict(X_candidates_scaled), dtype=float).reshape(-1)
+            penalty_factor = np.exp(alpha * np.maximum(0.0, cv_mu - feasible_tol))
+
+        acq_penalised = acq_raw * penalty_factor
+
+        length_scale = float(kwargs.get("length_scale", None) or (0.1 * np.mean(bounds[:, 1] - bounds[:, 0])))
+        chosen = []
+        chosen_idx = []
+        acq_working = acq_penalised.copy()
+        for _ in range(int(n_candidates)):
+            idx = int(np.argmin(acq_working))
+            if not np.isfinite(acq_working[idx]):
+                break
+            chosen.append(X_candidates_scaled[idx:idx+1, :])
+            chosen_idx.append(idx)
+            acq_working = self._diversity_penalty(acq_penalised, X_candidates_scaled, chosen, length_scale)
+            acq_working[np.array(chosen_idx, dtype=int)] = np.inf
+
+        if not chosen_idx:
+            idx = int(np.argmin(prescore))
+            chosen_idx = [idx]
+
+        X_best = X_candidates[np.array(chosen_idx), :]
+        info = {
+            "X_candidates": X_candidates,
+            "acq_raw": acq_raw,
+            "penalty_factor": penalty_factor,
+            "acq_penalised": acq_penalised,
+            "ehvi": ehvi_vals,
+            "shortlist_idx": shortlist_idx,
+            "prescore": prescore,
+        }
+        return X_best, info
+
+class AcquisitionFactory:
+    @staticmethod
+    def create(name: str, **kwargs) -> Acquisition:
+        name = name.upper()
+        if name == "BATCH_UCB":
+            allowed = {k: kwargs[k] for k in ["beta","batch_size","n_samples","random_seed","length_scale"] if k in kwargs}
+            return BatchGreedyUCB(**allowed)
+        if name == "EHVI":
+            allowed = {k: kwargs[k] for k in ["beta","batch_size","n_samples","random_seed","length_scale","reference_point"] if k in kwargs}
+            return BatchGreedyEHVI(**allowed)
+        else:
+            raise ValueError(f"Unknown acquisition: {name}")
+
+class EvaluatorBase:
+    @abstractmethod
+    def __init__(self, experiment):
+        self.experiment = experiment
+        self.config = experiment.config
+        self.logger = experiment.logger
+        self.gp_models = experiment.gp_models
+        self.experiment.input_repository = experiment.input_repository
+        self.experiment.output_repository = experiment.output_repository
+
+class InteractiveEvaluator(EvaluatorBase):
+    def __init__(self, inputs, objectives, constraints):
+        self.inputs = inputs
+        self.objectives = objectives
+        self.constraints = constraints
+
+    def _ask_float(self, prompt):
+        while True:
+            try:
+                return float(input(prompt))
+            except ValueError:
+                print("Please enter a valid number.")
+
+    def evaluate(self, X):
+        print("\n=== NEW EVALUATION ===")
+        print("Set machine to:")
+        for inp, val in zip(self.inputs, X[0]):
+            print(f"  {inp['name']} = {val:.6g}")
+
+        input("\nPress ENTER once measurement is complete...")
+
+        Y_obj = []
+        Y_error = []
+
+        print("\nEnter objective values:")
+        for obj in self.objectives:
+            v = self._ask_float(f"  {obj['name']} value: ")
+            r = self._ask_float(f"  {obj['name']} error  : ")
+            Y_obj.append(v)
+            Y_error.append(r)
+
+        Y_con = []
+        if self.constraints:
+            print("\nEnter constraint values:")
+            for con in self.constraints:
+                v = self._ask_float(f"  {con['name']} value: ")
+                Y_con.append(v)
+
+        Y_all = np.array(Y_obj + Y_con, dtype=float)
+        return Y_obj, np.array(Y_error, dtype=float).reshape(1, -1), Y_con
+
+    def evaluate_batch(self, X):
+        Ys, Yerror, Yc = [], [], []
+        for x in X:
+            y, r, c = self.evaluate(x.reshape(1, -1))
+            Ys.append(y)
+            Yerror.append(r)
+            Yc.append(c)
+        return np.array(Ys, dtype=float), np.array(Yerror, dtype=float), np.array(Yc)
+
+
+class GoalFunctionEvaluator(EvaluatorBase):
+    """Evaluator that calls a user-provided goal function and evaluates batches in parallel."""
+
+    def __init__(
+        self,
+        goal_fn,
+        inputs,
+        objectives_spec,
+        constraints_spec,
+        penalties_spec=None,
+        default_objective_error: float = 1e-3,
+        goal_function_path=None,
+        goal_function_name="goal_function",
+        goal_function_kwargs=None,
+        multiprocess_bool=False
+    ):
+        self.goal_fn = goal_fn
+        self.goal_function_path = goal_function_path
+        self.goal_function_name = goal_function_name
+        self.goal_function_kwargs = goal_function_kwargs
+        self.inputs = inputs
+        self.objectives_spec = objectives_spec
+        self.constraints_spec = constraints_spec or []
+        self.penalties_spec = penalties_spec or []
+        self.default_objective_error = float(default_objective_error)
+        self.multiprocess_bool=multiprocess_bool
+
+    def _coerce_vec(self, v, expected_len, name):
+        arr = np.asarray(v, dtype=float).reshape(-1)
+        if arr.size != expected_len:
+            raise ValueError(
+                f"Goal function returned {name} length {arr.size}, expected {expected_len}."
+            )
+        return arr
+
+    def _coerce_error(self, error, n_obj, n_con, n_pen):
+        if error is None:
+            return np.full(n_obj, self.default_objective_error, dtype=float)
+
+        r = np.asarray(error, dtype=float).reshape(-1)
+
+        if r.size == n_obj:
+            return np.clip(r, 0.0, None)
+
+        if (n_obj + n_con) and r.size == (n_obj + n_con):
+            return np.clip(r[:n_obj], 0.0, None)
+        
+        if (n_obj + n_con + n_pen) and r.size == (n_obj + n_con + n_pen):
+            return np.clip(r[:n_obj+n_con], 0.0, None)
+
+        # if n_con and r.size == n_con:
+        #     return np.full(n_obj, self.default_objective_error, dtype=float)
+
+        raise ValueError(
+            f"Goal function error length {r.size} does not match "
+            f"n_obj={n_obj}, n_obj+n_con={n_obj+n_con}, or n_obj+n_con+n_pen={n_obj+n_con+n_pen}."
+        )
+
+    @staticmethod
+    def _evaluate_single(args):
+        (   x,
+            goal_function_path,
+            goal_function_name,
+            goal_function_kwargs,
+            objectives_spec,
+            constraints_spec,
+            penalty,
+            default_objective_error,
+        ) = args
+
+        import importlib
+        import importlib.util
+
+        # Load goal function inside worker
+        if str(goal_function_path).endswith(".py") and os.path.exists(str(goal_function_path)):
+            spec = importlib.util.spec_from_file_location(
+                "mobo_goal_module", str(goal_function_path)
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        else:
+            mod = importlib.import_module(str(goal_function_path))
+
+        goal_fn = getattr(mod, goal_function_name)
+
+        n_obj = len(objectives_spec)
+        n_con = len(constraints_spec)
+        n_pen = len(penalty)
+
+        def _coerce_vec(v, expected_len, name):
+            arr = np.asarray(v, dtype=float).reshape(-1)
+            if arr.size != expected_len:
+                raise ValueError(
+                    f"Goal function returned {name} length {arr.size}, expected {expected_len}."
+                )
+            return arr
+
+        def _coerce_error(error):
+            if error is None:
+                return np.full(n_obj, default_objective_error, dtype=float)
+
+            r = np.asarray(error, dtype=float).reshape(-1)
+
+            if r.size == n_obj:
+                return np.clip(r, 0.0, None)
+
+            if (n_obj + n_con) and r.size == (n_obj + n_con):
+                return np.clip(r[:n_obj], 0.0, None)
+            
+            if (n_obj + n_con + n_pen) and r.size == (n_obj + n_con + n_pen):
+                return np.clip(r[:n_obj], 0.0, None)
+
+            # if n_con and r.size == n_con:
+            #     return np.full(n_obj, default_objective_error, dtype=float)
+
+            raise ValueError(
+                f"Goal function error length {r.size} does not match "
+                f"n_obj={n_obj}, n_con={n_con}, n_obj+n_con={n_obj+n_con}, or n_obj+n_con+n_pen={n_obj+n_con+n_pen}."
+            )
+
+
+        res = goal_fn(x.reshape(1,-1), **(goal_function_kwargs or {}))
+
+        pens = None
+        objs = None
+        cons = None
+        error = None
+        raw = None
+
+        if isinstance(res, dict):
+            raw = res.get("raw", None)
+            objs = res.get("objectives", res.get("objs", None))
+            cons = res.get("constraints", res.get("cons", None))
+            error = res.get("errors", None)
+            pens = res.get("penalties", None)
+
+        if raw is not None:
+            raw_arr = np.asarray(raw, dtype=float).reshape(-1)
+            if raw_arr.size != n_obj:
+                raise ValueError(
+                    f"Goal function returned raw length {raw_arr.size}, expected {n_obj}."
+                )
+        else:
+            raw_arr = _coerce_vec(objs, n_obj, "objectives")
+
+        cons_arr = (
+            _coerce_vec(cons if cons is not None else np.zeros(n_con), n_con, "constraints")
+            if n_con
+            else np.asarray([], dtype=float)
+        )
+
+        pen_arr = (
+            _coerce_vec(pens if pens is not None else np.zeros(n_pen), n_pen, "penalties")
+            if n_pen
+            else np.asarray([], dtype=float)
+        )
+
+        error_arr = _coerce_error(error)
+        return raw_arr, error_arr, cons_arr, pen_arr
+
+    def evaluate_batch(self, X: np.ndarray):
+        X = np.asarray(X, dtype=float)
+        X = np.atleast_2d(X)
+
+        n_batch = X.shape[0]
+
+        print(X)
+
+        args = [
+            (
+                X[i],
+                self.goal_function_path,
+                self.goal_function_name,
+                self.goal_function_kwargs,
+                self.objectives_spec,
+                self.constraints_spec,
+                self.penalties_spec,
+                self.default_objective_error,
+            )
+            for i in range(n_batch)
+        ]
+        print(args)
+
+        if self.multiprocess_bool==True:
+            with Pool(processes=os.cpu_count()) as pool:
+                results = pool.map(self._evaluate_single, args)
+        if self.multiprocess_bool==False:
+            results=[]
+            for i in range(len(X)):
+                print(args[i])
+                results.append(self._evaluate_single(args[i]))
+
+        raw_rows, error_rows, con_rows, pen_rows = zip(*results)
+
+        raw_new = np.vstack(raw_rows).astype(float)
+        error_new = np.vstack(error_rows).astype(float)
+        con_new = np.vstack(con_rows).astype(float) if len(self.constraints_spec) else np.empty((n_batch, 0))
+        pen_new = np.vstack(pen_rows).astype(float) if len(self.penalties_spec) else np.empty((n_batch, 0))
+
+        return raw_new, error_new, con_new, pen_new
+
+    def evaluate(self, X: np.ndarray):
+        raw, error, con, pen = self.evaluate_batch(X)
+        return raw, error, con, pen
+
+class EvaluatorFactory:
+    @staticmethod
+    def create(method: str, **kwargs) -> EvaluatorBase:
+        method = method.upper()
+        if method == "MANUAL":
+            inputs = kwargs["inputs"]
+            objectives = kwargs["objectives"]
+            constraints = kwargs.get("constraints", [])
+            return InteractiveEvaluator(inputs, objectives, constraints)
+
+        elif method in ("GOAL", "GOAL_FUNCTION", "FUNC", "FUNCTION"):
+            # Load goal function from a module path or .py file path
+            goal_path = kwargs.get("goal_function_path", "")
+            goal_name = kwargs.get("goal_function_name", "goal_function")
+            default_error = kwargs.get("default_objective_error", 1e-3)
+            multiprocess = kwargs.get("multiprocess_bool", False)
+            penalties_spec = kwargs.get("penalties", [])
+            goal_function_kwargs = kwargs.get("goal_function_kwargs", None)
+
+            if not goal_path:
+                raise ValueError("GOAL evaluation requires goal_function_path in config")
+
+            import importlib
+            import importlib.util
+
+            if str(goal_path).endswith(".py") and os.path.exists(str(goal_path)):
+                spec = importlib.util.spec_from_file_location("mobo_goal_module", str(goal_path))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            else:
+                mod = importlib.import_module(str(goal_path))
+
+            if not hasattr(mod, goal_name):
+                raise ValueError(f"Goal module '{goal_path}' has no function '{goal_name}'")
+
+            goal_fn = getattr(mod, goal_name)
+
+
+            return GoalFunctionEvaluator(goal_fn=goal_fn,
+                inputs=kwargs["inputs"],
+                objectives_spec=kwargs.get("objectives_spec") or kwargs.get("objectives"),
+                constraints_spec=kwargs.get("constraints_spec") or kwargs.get("constraints", []),
+                default_objective_error=default_error,
+                goal_function_path=goal_path,
+                goal_function_name=goal_name,
+                goal_function_kwargs= kwargs.get("goal_function_kwargs"),
+                multiprocess_bool=multiprocess,
+                penalties_spec=penalties_spec)
+        else:
+            raise ValueError(f"Unknown evaluation method: {method}")
+
+class MOBOPlotter:
+    def __init__(self):
+        pass
+
+    def _save_fig(self, filename: str, dpi=300):
+        path = filename
+        plt.tight_layout()
+        plt.savefig(path, dpi=dpi)
+        plt.close()
+        return path
+
+    def plot_acquisition(self, iteration: int, save_prefix: str, info: dict):
+        """Plot acquisition values for the candidate pool (raw vs penalised)."""
+        if not info:
+            return
+        Xc = info.get("X_candidates", None)
+        acq_raw = info.get("acq_raw", None)
+        acq_pen = info.get("acq_penalised", None)
+        if Xc is None or acq_raw is None:
+            return
+
+        plt.figure(figsize=(10, 4))
+        plt.plot(np.arange(len(acq_raw)), acq_raw, label="acq_raw")
+        if acq_pen is not None:
+            plt.plot(np.arange(len(acq_pen)), acq_pen, label="acq_penalised")
+        plt.xlabel("candidate index")
+        plt.ylabel("acquisition")
+        plt.title(f"Acquisition at iteration {iteration}")
+        plt.legend()
+
+        outdir = (getattr(self, "base_output_dir", None) or Path("Outputs")) / str(save_prefix)
+        outdir.mkdir(parents=True, exist_ok=True)
+        self._save_fig(str(outdir / f"acq_iter_{iteration:04d}.png"))
+
+    def plot_pareto_front(self, Pareto_front, Reference_point, Iteration,
+                        Best_pareto_front, Init_pareto_front, O_train, O_tot,
+                        Output_indices, Labels, save_prefix):
+        """Plot Pareto front with dominated hypervolume shading.
+        For 2D only!"""
+        pareto_sorted = Pareto_front[np.argsort(Pareto_front[:, 0])]
+        initial_sorted = Init_pareto_front[np.argsort(Init_pareto_front[:, 0])]
+        plt.figure(figsize=(8, 6))
+
+        # Step plot
+        for i in range(1, len(pareto_sorted)):
+            plt.plot([pareto_sorted[i-1, 0], pareto_sorted[i, 0]],
+                    [pareto_sorted[i-1, 1], pareto_sorted[i-1, 1]], 'orange')
+            plt.plot([pareto_sorted[i, 0], pareto_sorted[i, 0]],
+                    [pareto_sorted[i-1, 1], pareto_sorted[i, 1]], 'orange')
+
+        # Dominated HV shading
+        hv_x, hv_y = [Reference_point[0]], [Reference_point[1]]
+        for x, y in pareto_sorted:
+            hv_x.extend([x, x])
+            hv_y.extend([hv_y[-1], y])
+        hv_x.append(Reference_point[0])
+        hv_y.append(hv_y[-1])
+        plt.fill(hv_x, hv_y, color='b', alpha=0.3, label='Dominated HV')
+
+        plt.plot(initial_sorted[:, 0], initial_sorted[:, 1], 'x', label='Initial PF', color='b')
+        plt.plot(O_train[:, 0], O_train[:, 1], '+', c='k', label='All Samples')
+        plt.plot(Best_pareto_front[:, 0], Best_pareto_front[:, 1], 'x', c='r', label='Best PF')
+
+        plt.xlabel('Objective 1')
+        plt.ylabel('Objective 2')
+        plt.title(f'Dominated HV at Iteration {Iteration}')
+        plt.legend()
+        filename = f"{save_prefix}_HV_iter_{Iteration}.png"
+        return self._save_fig(filename)
+
+    def plot_3obj_pareto_physical_axes(self, Y, pareto_idx, objective_names, title="3D Pareto Front", cmap="viridis"):
+        """If D!=3, does not plot. """
+        if Y.shape[1]!=3:
+            return
+        first_obj_label = objective_names[0]
+        second_obj_label = objective_names[1]
+        third_obj_label = objective_names[2]
+        # ensure Y is a real 2D float array
+        Y = np.asarray(Y)
+    
+        # If a single point shape (3,), make it (1, 3)
+        if Y.ndim == 1:
+            Y = np.atleast_2d(Y)
+    
+        # If it's a scalar/unsized, error
+        if Y.ndim == 0:
+            raise ValueError(f"plot_3obj_pareto_physical_axes received a scalar: {Y!r}")
+    
+        # If object dtype, force numeric conversion
+        if Y.dtype == object:
+            Y = np.asarray(Y, dtype=float)
+    
+        mask = np.ones(Y.shape[0], dtype=bool)
+        mask[pareto_idx] = False
+    
+        plt.figure(figsize=(6, 5))
+    
+        # Background: dominated points
+        sc_bg = plt.scatter(
+            Y[mask, 0],
+            Y[mask, 1],
+            c=-Y[mask, 2],
+            cmap=cmap,
+            alpha=0.2,
+            s=25,
+            linewidths=0,
+        )
+    
+        # Foreground: 3D Pareto front
+        sc_pf = plt.scatter(
+            Y[pareto_idx, 0],
+            Y[pareto_idx, 1],
+            c=-Y[pareto_idx, 2],
+            cmap=cmap,
+            edgecolors="k",
+            s=60,
+            label="3D Pareto front",
+        )
+    
+        cbar = plt.colorbar(sc_pf)
+        cbar.set_label(third_obj_label)
+    
+        plt.xlabel(first_obj_label)
+        plt.ylabel(second_obj_label)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(str(Path(os.getcwd()) / f"{title}.png"))
+        # plt.show()
+
+    def plot_pareto_front_colourmap(self, Y_init, Y, pf_idx, objective_labels, objective_directions, save_name, CV=None, ax=None, cmap="viridis"):
+        """
+        Plot ALL sampled points in PHYSICAL space. This is for better operator interpretability
+          - feasible: circles coloured by objective 3 (physical)
+          - infeasible: x markers (gray)
+          - Pareto front (feasible PF): highlighted with black edge
+        For 2 or 3 dims - if 3 dims, 3rd objective is colour. If 2 dims, colour is just second objective again. Otherwise will only see 3 dimensions of whatever inputted.
+        """
+    
+        Y = np.asarray(Y, dtype=float)
+        if CV is None:
+            CV = np.zeros(len(Y), dtype=float)
+        CV = np.asarray(CV, dtype=float)
+    
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 5))
+    
+        # Convert to PHYSICAL values for plotting only (undo sign flip for "max")
+        Y_plot = Y.copy()
+        Y_init_plot=Y_init.copy()
+        for i, d in enumerate(objective_directions):
+            if d == "max":
+                Y_plot[:, i] = -Y_plot[:, i]
+                Y_init_plot[:,i]=-Y_init_plot[:,i]
+    
+        feasible = CV <= 1e-12
+        infeasible = ~feasible
+        init_feasible=feasible[:len(Y_init)]
+
+        n_obj = Y_plot.shape[1]
+        if n_obj < 2:
+            # nothing meaningful to scatter in 2D; just return
+            return
+        color_dim = 2 if n_obj >= 3 else 1  # for 2 objectives color by objective 2
+        c = Y_plot[feasible, color_dim]
+
+        
+
+        # all feasible points
+        sc = ax.scatter(
+            Y_plot[feasible, 0], Y_plot[feasible, 1],
+            c=c,
+            cmap=cmap,
+            s=45,
+            alpha=0.85,
+            edgecolor="none",
+            label="Feasible samples",
+        )
+    
+        # infeasible points
+        if np.any(infeasible):
+            ax.scatter(
+                Y_plot[infeasible, 0], Y_plot[infeasible, 1],
+                marker="x",
+                s=60,
+                linewidths=1.5,
+                c="gray",
+                alpha=0.9,
+                label="Infeasible samples",
+            )
+
+        c = Y_plot[pf_idx, color_dim]
+        # Pareto front points
+        pf_idx = np.asarray(pf_idx, dtype=int)
+        ax.scatter(
+            Y_plot[pf_idx, 0], Y_plot[pf_idx, 1],
+            c=c,
+            cmap=cmap,
+            s=80,
+            edgecolor="k",
+            linewidths=1.0,
+            label="Pareto front",
+        )
+
+        # plot initial samples
+        sc = ax.scatter(
+            Y_init_plot[init_feasible, 0], Y_init_plot[init_feasible, 1],
+            color='r',
+            marker='x',
+            s=45,
+            alpha=0.85,
+            edgecolor="none",
+            label="Initial samples",
+        )
+    
+        ax.set_xlabel('Objective 1')
+        ax.set_ylabel('Objective 2')
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_label('Objective 3')
+    
+        ax.set_title("Pareto front")
+        ax.grid(True)
+        ax.legend()
+        plt.tight_layout()
+    
+        plt.savefig(
+            str(Path(os.getcwd()) / "Outputs" / f"_{save_name}_current_sampled_points.png")
+        )
+        return ax
+
+
+    def plot_gp_models_over_discrete_grid(
+    self,
+    gp_models,
+    input_specs,   
+    X_train,
+    Y_train,
+    error_train=None,
+    CV_train=None,
+    labels=None,
+    iteration=None,
+    input_scaler=None,
+    output_scaler=None,
+    order="input0_slowest",
+    two_sigma=2.0,
+    feasible_tol=0.0,
+    default_objective_error=1e-3,
+    next_index=None,
+    save_path=None,
+    show=False,
+    max_candidates=None):
+        print('GP plotting')
+        if save_path==None:
+            save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_over_inputs_iter_{iteration}.png")
+            save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_over_inputs.png")
+    
+        # Build ordered discrete candidate list from input_specs
+        X_grid, _ = build_discrete_grid(input_specs, order=order)
+        if max_candidates is not None and X_grid.shape[0] > max_candidates:
+            X_grid = X_grid[:max_candidates]
+
+        N = X_grid.shape[0]
+        x_idx = np.arange(N)
+
+        # Predict across this grid
+        Xg = input_scaler.transform(X_grid) if input_scaler is not None else X_grid
+
+        n_obj = len(gp_models)
+        mu = np.zeros((n_obj, N))
+        std = np.zeros((n_obj, N))
+        for j, gp in enumerate(gp_models):
+            m, s = gp.predict(Xg, return_std=True)
+            if output_scaler is not None:
+                m = m * output_scaler.scale_[j] + output_scaler.mean_[j]
+                s = s * output_scaler.scale_[j]
+            mu[j] = m
+            std[j] = s
+
+        #Map training points to grid indices
+        train_idx = map_points_to_grid_index(X_train, X_grid)
+
+        # error and scaling consistency
+        Y_train = np.asarray(Y_train, float)
+        if error_train is None:
+            error_train = np.full_like(Y_train, float(default_objective_error))
+        else:
+            error_train = np.asarray(error_train, float)
+
+        Y_plot = Y_train.copy()
+        error_plot = error_train.copy()
+        if output_scaler is not None:
+            Y_plot = Y_plot * output_scaler.scale_ + output_scaler.mean_
+            error_plot = error_plot * output_scaler.scale_
+
+        #Feasibility mask
+        if CV_train is None:
+            feasible = np.ones(len(train_idx), dtype=bool)
+        else:
+            CV = np.asarray(CV_train, float)
+            feasible = (CV <= feasible_tol) if CV.ndim == 1 else np.all(CV <= feasible_tol, axis=1)
+        infeasible = ~feasible
+
+        #Plot
+        fig, ax = plt.subplots(figsize=(16, 9))
+        title = "Gaussian Process Models"
+        if iteration is not None:
+            title = f"Iteration {iteration}\n" + title
+        ax.set_title(title)
+        ax.set_xlabel("Ordered discrete candidates (index)")
+        ax.set_ylabel("Model")
+
+        colors = ['r', 'b', 'g', 'm', 'c', 'y']
+
+        for j in range(n_obj):
+            c = colors[j % len(colors)]
+            name = labels[j] if labels and j < len(labels) else f"Obj {j+1}"
+
+            ax.plot(x_idx[::1000], mu[j][::1000], c, label=f"GP model {name}")
+            ax.fill_between(x_idx[::1000], mu[j][::1000] - two_sigma * std[j][::1000], mu[j][::1000] + two_sigma * std[j][::1000], color=c, alpha=0.15)
+
+            y = Y_plot[:, j]
+            error = error_plot[:, j]
+            error = np.clip(np.asarray(error, dtype=float), 0.0, None)
+
+            if np.any(infeasible):
+                ax.errorbar(
+                    train_idx[infeasible], y[infeasible], yerr=error[infeasible],
+                    fmt='o', markersize=4, capsize=2, elinewidth=1,
+                    color='0.6', ecolor='0.6', alpha=0.8,
+                    label="measured infeasible ±error" if j == 0 else None
+                )
+            if np.any(feasible):
+                ax.errorbar(
+                    train_idx[feasible], y[feasible], yerr=error[feasible],
+                    fmt='o', markersize=4, capsize=2, elinewidth=1,
+                    color=c, ecolor=c, alpha=0.9,
+                    label="measured feasible ±error" if j == 0 else None
+                )
+
+        if next_index is not None:
+            ax.axvline(int(next_index), color='k', linestyle=':', alpha=0.9, label="Next point")
+
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+
+        if save_path is not None:
+            out_dir = os.path.dirname(save_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            fig.savefig(save_path, dpi=150, bbox_inches="tight")
+            # fig.savefig(save, dpi=150, bbox_inches="tight")
+            print(f"[plot_gp_models_over_discrete_grid] saved -> {save_path}")
+
+        # if show:
+        #     plt.show()
+        print(f'Saving gp models to {save_path}')
+        plt.savefig(save_path, dpi=200)
+
+        return X_grid
+
+
+    def plot_everything_with_error(self,
+        Iteration,
+        gp_models,
+        X_candidates,              
+        input_scaler=None,        
+        output_scaler=None,       
+        Labels=None,
+        objective_names=None,      
+        CV_train=None,
+        feasible_tol=0.0,
+        beta=2.0,
+        Weighting='F',
+        Weights=None,
+        UCB_values=None,         
+        top_indices=None,        
+        Penalise='F',
+        UCB_penalised=None,
+        X_train=None,                
+        Y_train=None,                
+        error_train=None,             
+        default_objective_error=1e-3,
+        include_meas_noise_in_band=True,  
+        save_path=None,):
+            """
+            Plot GP predictions over a candidate list, plus UCB on twin axis. Includes measurement error.
+            """
+            # print("first train row:", self.experiment.input_repository[0])
+            if save_path==None:
+                save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_iter_{Iteration}.png")
+                save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models.png")
+            n_obj = len(gp_models)
+            N = X_candidates.shape[0]
+
+            if Weights is None:
+                Weights = [1.0] * n_obj
+            Weights = np.asarray(Weights, float)
+
+            # beta handling
+            if np.isscalar(beta):
+                beta_vec = np.full(n_obj, float(beta))
+            else:
+                beta_vec = np.asarray(beta, float).reshape(-1)
+                if beta_vec.size != n_obj:
+                    raise ValueError(f"beta must be scalar or length {n_obj}")
+
+            if Weighting == 'T':
+                beta_vec = beta_vec * Weights
+
+            # Prepare candidate inputs in the same space GP expects
+            Xcand_gp = input_scaler.transform(X_candidates) if input_scaler is not None else X_candidates
+
+            # Predict for each objective
+            mu_list, std_list = [], []
+            for j, gp in enumerate(gp_models):
+                mu, std = gp.predict(Xcand_gp, return_std=True)
+                # If output was scaled during training, invert to physical
+                if output_scaler is not None:
+                    mu = mu * output_scaler.scale_[j] + output_scaler.mean_[j]
+                    std = std * output_scaler.scale_[j]
+                mu_list.append(mu)
+                std_list.append(std)
+
+            mu = np.vstack(mu_list)
+            sigma = np.vstack(std_list)
+
+            # Measurement noise level to add to the band
+            # We can use median error per objective from training data if provided
+            meas_sigma = np.full(n_obj, float(default_objective_error))
+            if error_train is not None:
+                error_train = np.asarray(error_train, float)
+                if output_scaler is not None:
+                    # if error was stored in scaled space, convert to physical
+                    meas_sigma = np.median(error_train, axis=0) * output_scaler.scale_[:n_obj]
+                else:
+                    meas_sigma = np.median(error_train, axis=0)
+
+            # Plot
+            fig, ax1 = plt.subplots(figsize=(16, 12))
+            fig.suptitle(f"Iteration {Iteration}")
+
+            x_idx = np.arange(N)
+            colours = ['r', 'b', 'g', 'm', 'c', 'y']
+
+            for j in range(n_obj):
+                c = colours[j % len(colours)]
+                name = None
+                if objective_names is not None and j < len(objective_names):
+                    name = objective_names[j]
+                elif Labels is not None:
+                    name = str(Labels[j])
+                else:
+                    name = f"Objective {j+1}"
+
+                y_mean = mu[j] * Weights[j]
+
+                # band std: GP std + measurement error
+                if include_meas_noise_in_band:
+                    std_plot = np.sqrt(sigma[j]**2 + meas_sigma[j]**2)
+                else:
+                    std_plot = sigma[j]
+
+                y_lo = y_mean - beta_vec[j] * Weights[j] * std_plot
+                y_hi = y_mean + beta_vec[j] * Weights[j] * std_plot
+
+                ax1.plot(x_idx, y_mean, c, label=f"GP model {name}")
+                ax1.fill_between(x_idx, y_lo, y_hi, alpha=0.2, color=c)
+
+            ax1.set_title("Gaussian Process Models")
+            ax1.set_xlabel("Input selections (candidate index)")
+            ax1.set_ylabel("Models")
+
+            # measured points on the SAME x-axis
+            if X_train is not None and Y_train is not None:
+                pool_idx = map_train_to_pool_indices(X_train, X_candidates)
+
+                # feasibility mask from CV_train
+                if CV_train is None:
+                    feasible = np.ones(len(pool_idx), dtype=bool)
+                else:
+                    CV = np.asarray(CV_train, float)
+                    if CV.ndim == 1:
+                        feasible = CV <= feasible_tol
+                    else:
+                        feasible = np.all(CV <= feasible_tol, axis=1)
+                infeasible = ~feasible
+
+                for j in range(n_obj):
+                    # physical units for scatter + error
+                    if output_scaler is not None:
+                        y_phys = Y_train[:, j] * output_scaler.scale_[j] + output_scaler.mean_[j]
+                        if error_train is not None:
+                            error_phys = np.asarray(error_train)[:, j] * output_scaler.scale_[j]
+                        else:
+                            error_phys = np.full_like(y_phys, default_objective_error, dtype=float)
+                    else:
+                        y_phys = Y_train[:, j]
+                        error_phys = np.asarray(error_train)[:, j] if error_train is not None else np.full_like(y_phys, default_objective_error)
+
+                    c = colours[j % len(colours)]
+
+                    # infeasible points in grey
+                    if np.any(infeasible):
+                        ax1.errorbar(
+                            pool_idx[infeasible],
+                            (y_phys * Weights[j])[infeasible],
+                            yerr=(error_phys * Weights[j])[infeasible],
+                            fmt="o",
+                            color="0.55",
+                            ecolor="0.55",
+                            capsize=3,
+                            markersize=5,
+                            alpha=0.85,
+                            label="measured infeasible ±error" if j == 0 else None,
+                        )
+
+                    # feasible points in objective colour
+                    if np.any(feasible):
+                        ax1.errorbar(
+                            pool_idx[feasible],
+                            (y_phys * Weights[j])[feasible],
+                            yerr=(error_phys * Weights[j])[feasible],
+                            fmt="o",
+                            color=c,
+                            ecolor=c,
+                            capsize=3,
+                            markersize=5,
+                            alpha=0.9,
+                            label="measured feasible ±error" if j == 0 else None,
+                        )
+
+            ax1.legend(loc="upper left")
+            plt.tight_layout()
+
+            if save_path:
+                plt.savefig(save_path, dpi=150)
+                plt.savefig(save, dpi=150)
+                plt.close(fig)
+            # else:
+            #     plt.show()
+
+            return
+
+    def plot_pareto_front_colored(self, X, Y, pareto_idx, iteration, i, save_name, error_Y=None):
+        """
+        Plot evaluated points colored by third objective, and highlight Pareto front
+        """
+        # X=X.to_numpy(dtype=float)
+        # Y=Y.to_numpy(dtype=float)
+        if Y.shape[1]!=3:
+            return
+        if error_Y is not None:
+            error_Y = np.asarray(error_Y, dtype=float)
+        # Create a color array based on evaluation order
+        order_colors = np.arange(len(Y))
+
+        plt.figure(figsize=(8,6))
+
+        if error_Y is not None and error_Y.shape == Y.shape:
+            plt.errorbar(
+                Y[:, 0], Y[:, 1],
+                xerr=error_Y[:, 0],
+                yerr=error_Y[:, 1],
+                fmt="none",
+                ecolor="0.6",
+                elinewidth=0.8,
+                alpha=0.35,
+                capsize=2,
+                zorder=1,
+            )
+
+        sc = plt.scatter(
+            Y[:, 0], Y[:, 1],
+            c=Y[:, 2],
+            cmap="viridis",
+            s=20,
+            edgecolor="None",
+            alpha=0.8,
+            label="Sampled Points",
+            zorder=2,
+        )
+
+        if error_Y is not None and error_Y.shape == Y.shape and len(pareto_idx) > 0:
+            plt.errorbar(
+                Y[pareto_idx, 0], Y[pareto_idx, 1],
+                xerr=error_Y[pareto_idx, 0],
+                yerr=error_Y[pareto_idx, 1],
+                fmt="none",
+                ecolor="k",
+                elinewidth=1.0,
+                alpha=0.6,
+                capsize=2,
+                zorder=3,
+            )
+
+        plt.scatter(
+            Y[pareto_idx, 0], Y[pareto_idx, 1],
+            c="None",
+            s=20,
+            edgecolor="k",
+            label="Pareto Front",
+            zorder=4,
+        )
+
+        plt.xlabel("Objective 1")
+        plt.ylabel("Objective 2")
+        plt.title(f"Pareto Front and Sample Order (Iteration {i} out of {iteration})")
+        plt.colorbar(sc, label="Objective 3 (2 if in 2dim)")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"_{save_name}_final_sampled_points.png"))
+
+
+
+    def plot_gp_slices_all_dims(
+    self,
+    gp_models,
+    input_bounds,
+    X_train,
+    Y_train,
+    error_train=None,
+    CV_train=None,
+    labels=None,
+    iteration=None,
+    input_scaler=None,
+    output_scaler=None,
+    x0=None,
+    anchor_x0_to_data=True,
+    n_grid=300,
+    two_sigma=2.0,
+    slice_tol_frac=0.10,
+    default_objective_error=1e-3,
+    feasible_tol=0.0,
+    save_path=None,
+            ):
+        """
+        Grid of 1D GP slices for each input dimension k.
+        - All training points are shown in every slice (projected onto x_k).
+        - Infeasible points are greyed out.
+        - Points near the slice (in other dims) get error error bars.
+        """
+        import math
+        print('Plotting sliced GPs')
+        if save_path==None:
+            save_path=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / f"gp_models_sliced_iter_{iteration}.png")
+            save=str(_get_outputs_dir(getattr(self, "config", type("C", (), {})())) / "gp_models_sliced.png")
+        X_train = np.asarray(X_train, float)
+        Y_train = np.asarray(Y_train, float)
+        n_train, d = X_train.shape
+        n_obj = len(gp_models)
+
+        # feasibility mask from CV train
+        if CV_train is None:
+            feasible = np.ones(n_train, dtype=bool)
+        else:
+            CV = np.asarray(CV_train, float)
+            if CV.ndim == 1:
+                feasible = CV <= feasible_tol
+            else:
+                feasible = np.all(CV <= feasible_tol, axis=1)
+
+        infeasible = ~feasible
+
+        # error
+        if error_train is None:
+            error_train = np.full((n_train, n_obj), float(default_objective_error), dtype=float)
+        else:
+            error_train = np.asarray(error_train, float)
+            if error_train.shape != (n_train, n_obj):
+                raise ValueError(f"error_train must be shape {(n_train, n_obj)}, got {error_train.shape}")
+
+        # choose x0
+        if x0 is None:
+            if anchor_x0_to_data:
+                x_med = np.median(X_train, axis=0)
+                idx0 = int(np.argmin(np.sum((X_train - x_med) ** 2, axis=1)))
+                x0 = X_train[idx0].copy()
+            else:
+                x0 = np.array([(a + b) / 2 for a, b in input_bounds], dtype=float)
+        else:
+            x0 = np.asarray(x0, float).reshape(-1)
+            if x0.shape[0] != d:
+                raise ValueError(f"x0 must have length {d}, got {x0.shape[0]}")
+
+        # subplot layout
+        ncols = 3 if d >= 3 else d
+        nrows = math.ceil(d / ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5.7 * ncols, 4.0 * nrows), squeeze=False)
+
+        # for "near slice" selection
+        widths = np.ptp(X_train, axis=0)
+        widths[widths == 0] = 1.0
+        tol = slice_tol_frac * widths
+
+        for k in range(d):
+            ax = axes[k // ncols][k % ncols]
+
+            # slice range
+            xmin, xmax = float(np.min(X_train[:, k])), float(np.max(X_train[:, k]))
+            pad = 0.05 * (xmax - xmin if xmax > xmin else 1.0)
+            xmin, xmax = xmin - pad, xmax + pad
+            t = np.linspace(xmin, xmax, n_grid)
+
+            Xg_raw = np.tile(x0, (n_grid, 1))
+            Xg_raw[:, k] = t
+            Xg = input_scaler.transform(Xg_raw) if input_scaler is not None else Xg_raw
+
+            # near-slice mask
+            other = [j for j in range(d) if j != k]
+            if len(other) == 0:
+                near = np.ones(n_train, dtype=bool)
+            else:
+                near = np.all(np.abs(X_train[:, other] - x0[other]) <= tol[other], axis=1)
+
+            # plot ALL training points (projected onto x_k)
+            # Show feasible in colour-ish, infeasible in grey
+            for j in range(n_obj):
+                if output_scaler is not None:
+                    y = Y_train[:, j] * output_scaler.scale_[j] + output_scaler.mean_[j]
+                    error = error_train[:, j] * output_scaler.scale_[j]
+                else:
+                    y = Y_train[:, j]
+                    error = error_train[:, j]
+
+                # infeasible (greyed out)
+                if np.any(infeasible):
+                    print('Plotting infeasible points')
+                    ax.scatter(
+                        X_train[infeasible, k], y[infeasible],
+                        s=12, alpha=0.35,
+                        color="0.6",  # grey
+                        label="infeasible (all)" if (k == 0 and j == 0) else None,
+                    )
+
+                # feasible (normal)
+                if np.any(feasible):
+                    print('Plotting feasible points')
+                    ax.scatter(
+                        X_train[feasible, k], y[feasible],
+                        s=14, alpha=0.45,
+                        label="feasible (all)" if (k == 0 and j == 0) else None,
+                    )
+
+                # error bars for points near slice
+                if np.any(near):
+                    print('Points near slice')
+                    # near & infeasible
+                    m = near & infeasible
+                    if np.any(m):
+                        ax.errorbar(
+                            X_train[m, k], y[m], yerr=error[m],
+                            fmt="o", markersize=4.5, capsize=2.5, elinewidth=1.0,
+                            color="0.45", ecolor="0.45", alpha=0.9,
+                            label="near slice ±error (infeas)" if (k == 0 and j == 0) else None,
+                        )
+                    # near & feasible
+                    m = near & feasible
+                    if np.any(m):
+                        ax.errorbar(
+                            X_train[m, k], y[m], yerr=error[m],
+                            fmt="o", markersize=4.5, capsize=2.5, elinewidth=1.0,
+                            alpha=0.95,
+                            label="near slice ±error (feas)" if (k == 0 and j == 0) else None,
+                        )
+
+            # GP mean/band for each objective
+            for j, gp in enumerate(gp_models):
+                mu, std = gp.predict(Xg, return_std=True)
+
+                if output_scaler is not None:
+                    mu = mu * output_scaler.scale_[j] + output_scaler.mean_[j]
+                    std = std * output_scaler.scale_[j]
+
+                name = labels[j] if labels and j < len(labels) else f"Obj {j+1}"
+                ax.plot(t, mu, label=f"{name} mean" if k == 0 else None)
+                ax.fill_between(t, mu - two_sigma * std, mu + two_sigma * std, alpha=0.18)
+
+            ax.set_title(f"Slice k={k} (near={int(np.sum(near))})")
+            ax.set_xlabel(f"Input {k}")
+            ax.set_ylabel("Objective")
+
+        # # turn off unused axes
+        for kk in range(d, nrows * ncols):
+            axes[kk // ncols][kk % ncols].axis("off")
+
+        title = "GP slices (all inputs)"
+        if iteration is not None:
+            title += f" – iter {iteration}"
+        fig.suptitle(title, y=1.02, fontsize=14)
+
+        # single legend
+        handles, leglabels = axes[0][0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, leglabels, loc="upper right")
+
+        fig.tight_layout()
+
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save, dpi=150, bbox_inches="tight")
+
+        plt.close(fig)
+
+    def plot_hypervolume_evolution(self, HV, eval_method, save_prefix, i, save_name):
+        plt.figure(figsize=(8, 6))
+        HV = np.array(HV).flatten()
+        plt.plot(range(len(HV)), HV, '-o', markersize=3, label="Hypervolume")
+        plt.xlabel("Iteration")
+        plt.ylabel("Hypervolume")
+        plt.title("Hypervolume Evolution")
+        plt.legend()
+        # plt.ylim(bottom=0)
+        filename = str(Path(os.getcwd()) / f"{save_prefix}_{save_name}_{eval_method}_HV_evolution.png")
+        plt.savefig(filename)
+        return 
+
+
+    def plot_runtime(self, runtime, save_prefix):
+        plt.figure(figsize=(8,6))
+        iterations=range(len(runtime))
+        plt.plot(iterations, runtime, '-o')
+        plt.xlabel("Iteration")
+        plt.ylabel("Runtime (s)")
+        plt.title("Runtime per Iteration")
+        plt.grid(True)
+        filename = str(Path(os.getcwd()) / f"{save_prefix}_runtime.png")
+        plt.savefig(filename, dpi=300)
+        plt.close()
+
+
+    def plot_pareto_comparison(self, final_pf, best_pf,
+                               init_pf, output_indices, Labels,
+                               eval_method, save_prefix, save_name):
+        """Compare final PF vs initial PF."""
+
+        final_pf = np.atleast_2d(final_pf)
+        # best_pf = np.atleast_2d(best_pf)
+        init_pf = np.atleast_2d(init_pf)
+
+        plt.figure(figsize=(8, 6))
+        plt.scatter(init_pf[:, 0], init_pf[:, 1], label="Initial PF", color="orange")
+        plt.scatter(final_pf[:, 0], final_pf[:, 1], marker='x', label="Final PF", color="blue")
+        # plt.scatter(best_pf[:, 0], best_pf[:, 1], label="Best PF", color="red")
+        plt.xlabel('Objective 1')
+        plt.ylabel('Objective 2')
+        plt.title("PF Comparison")
+        plt.legend()
+        filename = str(Path(os.getcwd()) /f"{save_prefix}_{save_name}_{eval_method}_PF_comparison.png")
+        return self._save_fig(filename)
+
+    def plot_sample_evolution(self, O_train, Trunc_pf, no_of_meas, Iteration,
+                              Labels, Output_indices, eval_method, save_prefix):
+        """Plot sample objective values over iterations."""
+        plt.figure(figsize=(8, 6))
+        plt.plot(range(len(O_train[no_of_meas:, 0])), O_train[no_of_meas:, 0], 'x', color='r',
+                 label='Objective 1')
+        plt.plot(range(len(O_train[no_of_meas:, 1])), O_train[no_of_meas:, 1], 'x', color='b',
+                 label='Objective 2')
+        plt.xlabel('Iteration')
+        # plt.ylim(0, 10)
+        plt.grid()
+        plt.legend()
+        filename = str(Path(os.getcwd()) /f"{save_prefix}_{eval_method}_samples_iter_{Iteration}.png")
+        return self._save_fig(filename)
+
+    def final_plots(self, O_train, O_tot, Output_indices, no_of_meas,
+                    Labels, save_prefix, eval_method, HV, Pareto_front,
+                    Init_pareto_front, Best_pareto_front, Reference_point):
+        """Convenience method: HV evolution + PF plot."""
+        self.plot_hypervolume_evolution(HV, eval_method, save_prefix)
+        self.plot_pareto_front(Pareto_front, Reference_point, 'Final',
+                               Best_pareto_front, Init_pareto_front,
+                               O_train, O_tot, Output_indices, Labels, save_prefix)
+
+
+    def plot_metrics_evolution(self, hypervolume: list, spacing: list, generational_distance: list, 
+        diversity: list, num_pf_points: list,runtime: list, save_prefix: str):
+        """
+        Plot the evolution of key metrics over iterations.
+        """
+        iterations = np.arange(1, len(hypervolume) + 1)
+
+        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+        axes = axes.flatten()
+
+        # 1. Hypervolume
+        axes[0].plot(iterations, hypervolume, marker='o', color='tab:blue')
+        axes[0].set_title("Hypervolume")
+        axes[0].set_xlabel("Iteration")
+        axes[0].set_ylabel("HV")
+        axes[0].grid(True)
+
+        # 2. Spacing
+        axes[1].plot(iterations, spacing, marker='o', color='tab:orange')
+        axes[1].set_title("Spacing")
+        axes[1].set_xlabel("Iteration")
+        axes[1].set_ylabel("Spacing")
+        axes[1].grid(True)
+
+        # 3. Generational Distance
+        axes[2].plot(iterations, generational_distance, marker='o', color='tab:green')
+        axes[2].set_title("Generational Distance")
+        axes[2].set_xlabel("Iteration")
+        axes[2].set_ylabel("GD")
+        axes[2].grid(True)
+
+        # 4. Diversity
+        axes[3].plot(iterations, diversity, marker='o', color='tab:red')
+        axes[3].set_title("Diversity")
+        axes[3].set_xlabel("Iteration")
+        axes[3].set_ylabel("Diversity")
+        axes[3].grid(True)
+
+        # 5. Number of Pareto Points
+        axes[4].plot(iterations, num_pf_points, marker='o', color='tab:purple')
+        axes[4].set_title("Number of Pareto Points")
+        axes[4].set_xlabel("Iteration")
+        axes[4].set_ylabel("Num Points")
+        axes[4].grid(True)
+
+        # 6. Runtime
+        axes[5].plot(iterations, runtime, marker='o', color='tab:brown')
+        axes[5].set_title("Runtime per Iteration")
+        axes[5].set_xlabel("Iteration")
+        axes[5].set_ylabel("Time (s)")
+        axes[5].grid(True)
+
+        plt.tight_layout()
+        filename = str(Path(os.getcwd()) /f"{save_prefix}_metrics_evolution.png")
+        plt.savefig(filename, dpi=300)
+        plt.close()
+        return filename
+
+class Metrics:
+    """Centralised metrics for multi-objective optimization with scaling."""
+
+    @staticmethod
+    def _finite_rows(pf: np.ndarray) -> np.ndarray:
+        pf = np.asarray(pf, dtype=float)
+        if pf.ndim == 1:
+            pf = pf.reshape(-1, 1)
+        if pf.size == 0:
+            return pf.reshape(0, pf.shape[1] if pf.ndim == 2 else 0)
+        mask = np.all(np.isfinite(pf), axis=1)
+        return pf[mask]
+
+    @staticmethod
+    def _scale(pf: np.ndarray) -> np.ndarray:
+        if len(pf) == 0:
+            return np.asarray(pf)
+        pf = Metrics._finite_rows(pf)
+        if len(pf) == 0:
+            return pf
+        scaler = StandardScaler()
+        return scaler.fit_transform(pf)
+
+    @staticmethod
+    def hypervolume(pf: np.ndarray, ref: np.ndarray) -> float:
+        pf = Metrics._finite_rows(pf)
+        ref = np.asarray(ref, dtype=float).reshape(-1)
+        if len(pf) == 0 or not np.all(np.isfinite(ref)):
+            return 0.0
+        hv = HV(ref_point=ref)
+        return float(hv.do(pf))
+
+    @staticmethod
+    def generational_distance(pf: np.ndarray, pf_ref: np.ndarray) -> float:
+        if pf.size == 0 or pf_ref.size == 0:
+            return np.inf
+        pf_scaled = Metrics._scale(pf)
+        pf_ref_scaled = Metrics._scale(pf_ref)
+        if pf_scaled.size == 0 or pf_ref_scaled.size == 0:
+            return np.inf
+        dists = cdist(pf_scaled, pf_ref_scaled)
+        return float(np.mean(np.min(dists, axis=1)))
+
+    @staticmethod
+    def inverted_generational_distance(pf: np.ndarray, pf_ref: np.ndarray) -> float:
+        if pf.size == 0 or pf_ref.size == 0:
+            return np.inf
+        pf_scaled = Metrics._scale(pf)
+        pf_ref_scaled = Metrics._scale(pf_ref)
+        if pf_scaled.size == 0 or pf_ref_scaled.size == 0:
+            return np.inf
+        dists = cdist(pf_ref_scaled, pf_scaled)
+        return float(np.mean(np.min(dists, axis=1)))
+
+    @staticmethod
+    def diversity(pf: np.ndarray) -> float:
+        if len(pf) < 2:
+            return 0.0
+        pf_scaled = Metrics._scale(pf)
+        if len(pf_scaled) < 2:
+            return 0.0
+        pf_sorted = pf_scaled[np.argsort(pf_scaled[:, 0])]
+        distances = np.linalg.norm(np.diff(pf_sorted, axis=0), axis=1)
+        return float(np.std(distances))
+
+    @staticmethod
+    def spacing(pf: np.ndarray) -> float:
+        if len(pf) < 2:
+            return 0.0
+        pf_scaled = Metrics._scale(pf)
+        if len(pf_scaled) < 2:
+            return 0.0
+        dists = cdist(pf_scaled, pf_scaled)
+        np.fill_diagonal(dists, np.inf)
+        min_dists = np.min(dists, axis=1)
+        return float(np.std(min_dists))
+    @staticmethod
+    def num_pf_points(pf: np.ndarray) -> int:
+        """Number of points on Pareto front."""
+        return int(len(pf))
